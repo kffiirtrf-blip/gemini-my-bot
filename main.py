@@ -13,8 +13,8 @@ TELEGRAM_TOKEN = "9129090353:AAFOZU4NEVz1SzXow8JQe5CIx1a0sSam19I"
 GEMINI_KEY = os.environ.get("GEMINI_KEY", "")
 
 TEXT_MODELS = ["gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-3.5-flash"]
-TIMEOUT_SECONDS = 600  # Память контекста 10 минут
-ACTIVE_SESSION_SECONDS = 90  # Окно живого диалога без слова "гемини" (90 сек)
+TIMEOUT_SECONDS = 600
+ACTIVE_SESSION_SECONDS = 90
 SLOW_MODE_SECONDS = 6
 
 MATH_INSTRUCTION = (
@@ -30,8 +30,9 @@ BOT_NAME = bot_info.username.lower()
 
 chat_memory = {}
 last_send_time = {}
-# Активные сессии живого разговора: {chat_id: {"user_id": int, "expires_at": float}}
 active_sessions = {}
+# Кэш последних фото в чатах: {chat_id: {"file_id": str, "time": float}}
+last_chat_photo = {}
 
 app = Flask(__name__)
 
@@ -133,6 +134,38 @@ def transcribe_audio_bytes(b64_audio):
     return None
 
 
+def solve_image_task(file_id, prompt, username_tag):
+    """Анализирует фото через Gemini"""
+    try:
+        file_info = bot.get_file(file_id)
+        file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_info.file_path}"
+        img_bytes = requests.get(file_url).content
+        b64_image = base64.b64encode(img_bytes).decode("utf-8")
+    except Exception:
+        return "Не удалось загрузить фото из Телеграма."
+
+    parts_data = [
+        {"text": f"Вопрос от {username_tag}: {prompt}"},
+        {"inlineData": {"mimeType": "image/jpeg", "data": b64_image}},
+    ]
+    data = {
+        "systemInstruction": {"parts": [{"text": MATH_INSTRUCTION}]},
+        "contents": [{"role": "user", "parts": parts_data}],
+    }
+
+    for model in TEXT_MODELS:
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
+            res = requests.post(url, json=data, timeout=20).json()
+            if "candidates" in res:
+                return clean_latex(
+                    res["candidates"][0]["content"]["parts"][0]["text"]
+                )
+        except Exception:
+            continue
+    return "Сервера Google заняты, попробуй еще раз через пару секунд!"
+
+
 # 1. Команды /img, /history, /clear
 @bot.message_handler(commands=["img", "pic", "image", "art"])
 def cmd_image(message):
@@ -203,7 +236,6 @@ def handle_voice(message):
         wait_slow_mode(message.chat.id)
         clean_ans = clean_latex(answer)
         bot.reply_to(message, f"{username_tag} {clean_ans}")
-        # Открываем сессию диалога
         active_sessions[message.chat.id] = {
             "user_id": user.id,
             "expires_at": time.time() + ACTIVE_SESSION_SECONDS,
@@ -272,9 +304,15 @@ def handle_document(message):
     bot.reply_to(message, "Не удалось обработать документ.")
 
 
-# 4. Фотографии
+# 4. ФОТОГРАФИИ (Всегда молча кэшируем в память чата!)
 @bot.message_handler(content_types=["photo"])
 def handle_photo(message):
+    # Запоминаем последнее фото в этом чате на 20 минут
+    last_chat_photo[message.chat.id] = {
+        "file_id": message.photo[-1].file_id,
+        "time": time.time(),
+    }
+
     is_private = message.chat.type == "private"
     is_reply_to_bot = (
         message.reply_to_message is not None
@@ -284,54 +322,25 @@ def handle_photo(message):
     is_name = any(n in caption for n in ["gemini", "гемини", "геминай"])
     is_mentioned = f"@{BOT_NAME}" in caption
 
+    # Если фото прислали без обращения к боту — просто оставляем в кэше и молчим
     if not is_private and not (is_reply_to_bot or is_mentioned or is_name):
         return
 
     bot.send_chat_action(message.chat.id, "typing")
     user = message.from_user
     username_tag = f"@{user.username}" if user.username else user.first_name
-    clean_caption = (
-        message.caption or "Опиши подробно, что на фото / реши задачу."
-    )
+    prompt = message.caption or "Опиши подробно, что на фото / реши задачу."
 
-    try:
-        file_info = bot.get_file(message.photo[-1].file_id)
-        file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_info.file_path}"
-        img_bytes = requests.get(file_url).content
-        b64_image = base64.b64encode(img_bytes).decode("utf-8")
-    except Exception:
-        bot.reply_to(message, "Не удалось загрузить фото.")
-        return
-
-    parts_data = [
-        {"text": f"Пользователь {username_tag} отправил фото: {clean_caption}"},
-        {"inlineData": {"mimeType": "image/jpeg", "data": b64_image}},
-    ]
-    data = {
-        "systemInstruction": {"parts": [{"text": MATH_INSTRUCTION}]},
-        "contents": [{"role": "user", "parts": parts_data}],
+    ans = solve_image_task(message.photo[-1].file_id, prompt, username_tag)
+    wait_slow_mode(message.chat.id)
+    bot.reply_to(message, f"{username_tag} {ans}")
+    active_sessions[message.chat.id] = {
+        "user_id": user.id,
+        "expires_at": time.time() + ACTIVE_SESSION_SECONDS,
     }
 
-    for model in TEXT_MODELS:
-        try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
-            res = requests.post(url, json=data, timeout=15).json()
-            if "candidates" in res:
-                answer = res["candidates"][0]["content"]["parts"][0]["text"]
-                wait_slow_mode(message.chat.id)
-                clean_ans = clean_latex(answer)
-                bot.reply_to(message, f"{username_tag} {clean_ans}")
-                active_sessions[message.chat.id] = {
-                    "user_id": user.id,
-                    "expires_at": time.time() + ACTIVE_SESSION_SECONDS,
-                }
-                return
-        except Exception:
-            continue
-    bot.reply_to(message, "Ошибка распознавания фото.")
 
-
-# 5. ТЕКСТОВЫЕ ОТВЕТЫ (УМНЫЙ РЕЖИМ ЖИВОГО ДИАЛОГА)
+# 5. ТЕКСТОВЫЕ ОТВЕТЫ (УМЕЕТ ПОДТЯГИВАТЬ СТАРЫЕ ФОТО ИЗ ЧАТА!)
 @bot.message_handler(func=lambda msg: True)
 def answer_text(message):
     if not message.text:
@@ -385,20 +394,18 @@ def answer_text(message):
                 )
                 return
 
-    # 🛑 ПРОВЕРКА: Активна ли сессия живого диалога в этом чате?
+    # 🛑 Сессия живого диалога
     session = active_sessions.get(chat_id)
     is_in_active_session = False
 
     if session:
         if now < session["expires_at"]:
-            # Если человек ответил реплаем на сообщение ДРУГА (не бота) -> выходим из сессии, бот молчит!
             if (
                 message.reply_to_message
                 and message.reply_to_message.from_user.id != bot_info.id
             ):
                 active_sessions.pop(chat_id, None)
                 is_in_active_session = False
-            # Если в сообщении явно обращаются к пацанам
             elif any(
                 w in text_lower
                 for w in [
@@ -406,152 +413,3 @@ def answer_text(message):
                     "парни",
                     "го в ",
                     "гоу в ",
-                    "илья",
-                    "серёга",
-                    "женя",
-                ]
-            ):
-                active_sessions.pop(chat_id, None)
-                is_in_active_session = False
-            else:
-                is_in_active_session = True
-        else:
-            active_sessions.pop(chat_id, None)
-
-    # Слова для быстрого завершения разговора с ботом
-    stop_words = ["отбой", "хватит", "молчи", "стоп", "пока", "все спасибо"]
-    if is_in_active_session and any(w in text_lower for w in stop_words):
-        active_sessions.pop(chat_id, None)
-        wait_slow_mode(chat_id)
-        bot.reply_to(message, f"{username_tag} Понял, не мешаю разговору! 👍")
-        return
-
-    # Базовые триггеры вызова
-    is_reply_to_bot = (
-        message.reply_to_message is not None
-        and message.reply_to_message.from_user.id == bot_info.id
-    )
-    is_mentioned = f"@{BOT_NAME}" in text_lower
-    is_name_called = any(
-        n in text_lower for n in ["gemini", "гемини", "геминай"]
-    )
-    is_command = message.text.startswith("/ask") or message.text.startswith(
-        "/ai"
-    )
-
-    should_respond = (
-        is_private
-        or is_reply_to_bot
-        or is_mentioned
-        or is_command
-        or is_name_called
-        or is_in_active_session
-    )
-
-    if not is_private and not should_respond:
-        return
-
-    # Очищаем текст от имени бота
-    clean_text = message.text
-    for prefix in [
-        f"@{bot_info.username}",
-        f"@{BOT_NAME}",
-        "/ask",
-        "/ai",
-        "gemini",
-        "гемини",
-        "геминай",
-        "Gemini",
-        "Гемини",
-    ]:
-        clean_text = re.sub(
-            re.escape(prefix), "", clean_text, flags=re.IGNORECASE
-        )
-    clean_text = clean_text.strip(" ,:.-?!")
-
-    if not clean_text:
-        bot.reply_to(message, f"{username_tag} Я тут! Чем помочь?")
-        return
-
-    # Генерация картинок по тексту
-    lower = clean_text.lower()
-    draw_triggers = [
-        "нарисуй мне",
-        "нарисуй",
-        "сгенерируй картинку",
-        "сгенерируй фото",
-        "сгенерируй арт",
-        "сгенерируй",
-        "сделай картинку",
-        "сделай фото",
-        "изобрази",
-        "создай фото",
-        "создай арт",
-        "draw",
-    ]
-    for trigger in draw_triggers:
-        if lower.startswith(trigger):
-            art_prompt = clean_text[len(trigger) :].strip(" :,-")
-            if art_prompt:
-                generate_free_art(chat_id, art_prompt, message.message_id)
-                return
-
-    bot.send_chat_action(chat_id, "typing")
-    history = get_or_reset_memory(chat_id)
-
-    tagged_message = (
-        f"Пользователь {username_tag} ({user.first_name}) пишет: {clean_text}"
-    )
-    new_user_message = {"role": "user", "parts": [{"text": tagged_message}]}
-
-    data = {
-        "systemInstruction": {"parts": [{"text": MATH_INSTRUCTION}]},
-        "contents": history + [new_user_message],
-    }
-
-    for model in TEXT_MODELS:
-        try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
-            response = requests.post(url, json=data, timeout=12)
-            res = response.json()
-
-            if "candidates" in res:
-                answer = res["candidates"][0]["content"]["parts"][0]["text"]
-                wait_slow_mode(chat_id)
-
-                clean_ans = clean_latex(answer)
-                clean_reply = f"{username_tag} {clean_ans}"
-                bot.reply_to(message, clean_reply)
-
-                # 🔥 ВКЛЮЧАЕМ/ПРОДЛЕВАЕМ ОКНО ДИАЛОГА НА 90 СЕКУНД:
-                active_sessions[chat_id] = {
-                    "user_id": user.id,
-                    "expires_at": now + ACTIVE_SESSION_SECONDS,
-                }
-
-                history.append(new_user_message)
-                history.append(
-                    {
-                        "role": "model",
-                        "parts": [
-                            {"text": f"Ответ для {username_tag}: {clean_ans}"}
-                        ],
-                    }
-                )
-                if len(history) > 20:
-                    chat_memory[chat_id]["messages"] = history[-20:]
-                return
-        except Exception:
-            continue
-
-    bot.reply_to(message, f"{username_tag} Сервера Google заняты, повтори!")
-
-
-def run_telebot():
-    bot.infinity_polling(timeout=20, long_polling_timeout=10)
-
-
-if __name__ == "__main__":
-    threading.Thread(target=run_telebot, daemon=True).start()
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
