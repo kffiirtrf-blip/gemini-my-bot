@@ -9,29 +9,17 @@ from flask import Flask
 import requests
 import telebot
 
-TELEGRAM_TOKEN = "9129090353:AAFOZU4NEVz1SzXow8JQe5CIx1a0sSam19I"
-GEMINI_KEY = os.environ.get("GEMINI_KEY", "")
-
-TEXT_MODELS = ["gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-3.5-flash"]
-TIMEOUT_SECONDS = 600
-ACTIVE_SESSION_SECONDS = 90
-SLOW_MODE_SECONDS = 6
-
-MATH_INSTRUCTION = (
-    "Ты умный помощник в Телеграме. Важнейшее правило оформления: НИКОГДА не используй "
-    "LaTeX-разметку (никаких $, $$, \\frac, \\sqrt, \\cdot, \\text и подобных тегов)! "
-    "Телеграм не поддерживает LaTeX. Записывай любые математические формулы понятным текстом "
-    "с юникод-символами: ², ³, √, ±, ÷, ×, ≠, ≤, ≥, π, а дроби пиши через наклонную черту / со скобками."
+TOKEN = "9129090353:AAFOZU4NEVz1SzXow8JQe5CIx1a0sSam19I"
+KEY = os.environ.get("GEMINI_KEY", "")
+MODELS = ["gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-3.5-flash"]
+MATH_RULE = (
+    "Никогда не используй LaTeX ($, $$, \\frac, \\sqrt). Пиши формулы обычным"
+    " текстом: x², √x, ±, ÷, ×, (a)/(b)."
 )
 
-bot = telebot.TeleBot(TELEGRAM_TOKEN)
-bot_info = bot.get_me()
-BOT_NAME = bot_info.username.lower()
-
-chat_memory = {}
-last_send_time = {}
-active_sessions = {}
-last_chat_photo = {}
+bot = telebot.TeleBot(TOKEN)
+bot_name = bot.get_me().username.lower()
+memory, last_send, sessions, last_photo = {}, {}, {}, {}
 
 app = Flask(__name__)
 
@@ -41,449 +29,292 @@ def home():
     return "Bot is alive 24/7!"
 
 
-def clean_latex(text):
-    if not text:
+def clean_latex(t):
+    if not t:
         return ""
-    text = re.sub(r"\\frac\{([^}]+)\}\{([^}]+)\}", r"(\1)/(\2)", text)
-    text = re.sub(r"\\sqrt\{([^}]+)\}", r"√(\1)", text)
-    text = re.sub(r"\\sqrt\[(\d+)\]\{([^}]+)\}", r"\1√(\2)", text)
-    text = re.sub(r"\\text\{([^}]+)\}", r"\1", text)
-    text = re.sub(r"\\mathbf\{([^}]+)\}", r"\1", text)
-    text = re.sub(r"\\cdot", "·", text)
-    text = re.sub(r"\\times", "×", text)
-    text = re.sub(r"\\pm", "±", text)
-    text = re.sub(r"\\approx", "≈", text)
-    text = re.sub(r"\\neq", "≠", text)
-    text = re.sub(r"\\le(?:q)?", "≤", text)
-    text = re.sub(r"\\ge(?:q)?", "≥", text)
-    text = re.sub(r"\\pi", "π", text)
-    text = re.sub(r"\\infty", "∞", text)
-    text = re.sub(r"\\degree", "°", text)
-    text = text.replace("$$", "").replace("$", "")
+    t = re.sub(r"\\frac\{([^}]+)\}\{([^}]+)\}", r"(\1)/(\2)", t)
+    t = re.sub(r"\\sqrt\{([^}]+)\}", r"√(\1)", t)
+    for k, v in [
+        ("\\cdot", "·"),
+        ("\\times", "×"),
+        ("\\pm", "±"),
+        ("\\neq", "≠"),
+        ("\\le", "≤"),
+        ("\\ge", "≥"),
+        ("\\pi", "π"),
+        ("$$", ""),
+        ("$", ""),
+    ]:
+        t = t.replace(k, v)
     return (
-        text.replace(r"\[", "")
+        t.replace(r"\[", "")
         .replace(r"\]", "")
         .replace(r"\(", "")
         .replace(r"\)", "")
     )
 
 
-def wait_slow_mode(chat_id):
-    now = time.time()
-    last = last_send_time.get(chat_id, 0)
-    diff = now - last
-    if diff < SLOW_MODE_SECONDS:
-        time.sleep(SLOW_MODE_SECONDS - diff)
-    last_send_time[chat_id] = time.time()
+def wait_slow(cid):
+    d = time.time() - last_send.get(cid, 0)
+    if d < 6:
+        time.sleep(6 - d)
+    last_send[cid] = time.time()
 
 
-def get_or_reset_memory(chat_id):
-    now = time.time()
-    if chat_id in chat_memory:
-        if now - chat_memory[chat_id]["last_time"] > TIMEOUT_SECONDS:
-            chat_memory[chat_id] = {"last_time": now, "messages": []}
-    else:
-        chat_memory[chat_id] = {"last_time": now, "messages": []}
-    chat_memory[chat_id]["last_time"] = now
-    return chat_memory[chat_id]["messages"]
-
-
-# 🎨 Генерация артов через FLUX
-def generate_free_art(chat_id, prompt, reply_to_id=None):
-    wait_slow_mode(chat_id)
-    bot.send_message(chat_id, "🎨 Рисую арт, подожди секунд 5...")
-
-    encoded = urllib.parse.quote(prompt)
-    seed = random.randint(1000, 999999)
-    image_url = f"https://image.pollinations.ai/prompt/{encoded}?model=flux&nologo=true&seed={seed}&width=1024&height=1024"
-
-    try:
-        wait_slow_mode(chat_id)
-        bot.send_photo(
-            chat_id,
-            image_url,
-            caption=f"✨ {prompt}",
-            reply_to_message_id=reply_to_id,
-        )
-    except Exception as err:
-        bot.send_message(chat_id, f"Ошибка создания картинки: {err}")
-
-
-def transcribe_audio_bytes(b64_audio):
-    parts_data = [
-        {
-            "text": (
-                "Дословно переведи это голосовое сообщение в текст на русском"
-                " языке. Напиши ТОЛЬКО текст того, что сказал человек, без"
-                " лишних комментариев и пояснений."
-            )
-        },
-        {"inlineData": {"mimeType": "audio/ogg", "data": b64_audio}},
-    ]
-    data = {"contents": [{"role": "user", "parts": parts_data}]}
-
-    for model in TEXT_MODELS:
+def ask_gemini(data, timeout=15):
+    for m in MODELS:
         try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
-            res = requests.post(url, json=data, timeout=25).json()
-            if "candidates" in res:
-                return res["candidates"][0]["content"]["parts"][0]["text"]
-        except Exception:
-            continue
-    return None
-
-
-def solve_image_task(file_id, prompt, username_tag):
-    try:
-        file_info = bot.get_file(file_id)
-        file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_info.file_path}"
-        img_bytes = requests.get(file_url).content
-        b64_image = base64.b64encode(img_bytes).decode("utf-8")
-    except Exception:
-        return "Не удалось загрузить фото из Телеграма."
-
-    parts_data = [
-        {"text": f"Вопрос от {username_tag}: {prompt}"},
-        {"inlineData": {"mimeType": "image/jpeg", "data": b64_image}},
-    ]
-    data = {
-        "systemInstruction": {"parts": [{"text": MATH_INSTRUCTION}]},
-        "contents": [{"role": "user", "parts": parts_data}],
-    }
-
-    for model in TEXT_MODELS:
-        try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
-            res = requests.post(url, json=data, timeout=20).json()
-            if "candidates" in res:
+            r = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{m}:generateContent?key={KEY}",
+                json=data,
+                timeout=timeout,
+            ).json()
+            if "candidates" in r:
                 return clean_latex(
-                    res["candidates"][0]["content"]["parts"][0]["text"]
+                    r["candidates"][0]["content"]["parts"][0]["text"]
                 )
-        except Exception:
-            continue
-    return "Сервера Google заняты, попробуй еще раз через пару секунд!"
+        except:
+            pass
+    return "Сервера Google заняты, попробуй еще раз!"
 
 
-# 1. Команды /img, /history, /clear
-@bot.message_handler(commands=["img", "pic", "image", "art"])
-def cmd_image(message):
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        bot.reply_to(
-            message,
-            "Напиши, что нарисовать. Пример:\n/img желтый спорткар ночью",
+def send_art(cid, prompt, rid=None):
+    wait_slow(cid)
+    bot.send_message(chat_id=cid, text="🎨 Рисую арт (без логотипов), подожди...")
+    url = f"https://image.pollinations.ai/prompt/{urllib.parse.quote(prompt)}?model=flux&nologo=true&seed={random.randint(1,999999)}&width=1024&height=1024"
+    try:
+        wait_slow(cid)
+        bot.send_photo(
+            cid, url, caption=f"✨ {prompt}", reply_to_message_id=rid
         )
-        return
-    generate_free_art(message.chat.id, parts[1], message.message_id)
+    except Exception as e:
+        bot.send_message(chat_id=cid, text=f"Ошибка: {e}")
+
+
+@bot.message_handler(commands=["img", "pic", "image", "art"])
+def cmd_img(m):
+    p = m.text.split(maxsplit=1)
+    if len(p) > 1:
+        send_art(m.chat.id, p[1], m.message_id)
+    else:
+        bot.reply_to(m, "Напиши, что нарисовать. Пример: /img кот")
 
 
 @bot.message_handler(commands=["history"])
-def show_history(message):
-    wait_slow_mode(message.chat.id)
-    messages = get_or_reset_memory(message.chat.id)
-    if not messages:
-        bot.reply_to(
-            message, "Память пуста или прошло больше 10 минут молчания."
+def cmd_hist(m):
+    h = memory.get(m.chat.id, {}).get("msgs", [])
+    if not h:
+        return bot.reply_to(m, "Память пуста или прошло 10 минут.")
+    txt = "📜 История диалога:\n" + "\n".join([
+        (
+            f"{'👤' if x['role']=='user' else '🤖'}"
+            f" {x['parts'][0].get('text','')[:100]}"
         )
-        return
-
-    text_history = "📜 **История диалога:**\n\n"
-    for item in messages:
-        role = "👤" if item["role"] == "user" else "🤖"
-        part_text = item["parts"][0].get("text", "[Медиа/Файл]")
-        text_history += f"{role} {part_text[:120]}\n"
-    bot.reply_to(message, text_history)
+        for x in h
+    ])
+    bot.reply_to(m, txt)
 
 
 @bot.message_handler(commands=["clear", "reset"])
-def clear_memory(message):
-    wait_slow_mode(message.chat.id)
-    chat_memory[message.chat.id] = {"last_time": time.time(), "messages": []}
-    active_sessions.pop(message.chat.id, None)
-    bot.reply_to(message, "🧹 Память диалога очищена!")
+def cmd_clear(m):
+    memory.pop(m.chat.id, None)
+    sessions.pop(m.chat.id, None)
+    bot.reply_to(m, "🧹 Память очищена!")
 
 
-# 2. Голосовые сообщения
 @bot.message_handler(content_types=["voice", "audio"])
-def handle_voice(message):
-    is_private = message.chat.type == "private"
-    is_reply_to_bot = (
-        message.reply_to_message is not None
-        and message.reply_to_message.from_user.id == bot_info.id
-    )
-
-    if not is_private and not is_reply_to_bot:
-        return
-
-    bot.send_chat_action(message.chat.id, "typing")
-    user = message.from_user
-    username_tag = f"@{user.username}" if user.username else user.first_name
-
-    try:
-        voice = message.voice or message.audio
-        file_info = bot.get_file(voice.file_id)
-        file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_info.file_path}"
-        audio_bytes = requests.get(file_url).content
-        b64_audio = base64.b64encode(audio_bytes).decode("utf-8")
-    except Exception:
-        bot.reply_to(message, "Не удалось загрузить голосовое сообщение.")
-        return
-
-    answer = transcribe_audio_bytes(b64_audio)
-    if answer:
-        wait_slow_mode(message.chat.id)
-        clean_ans = clean_latex(answer)
-        bot.reply_to(message, f"{username_tag} {clean_ans}")
-        active_sessions[message.chat.id] = {
-            "user_id": user.id,
-            "expires_at": time.time() + ACTIVE_SESSION_SECONDS,
-        }
-    else:
-        bot.reply_to(message, "Не удалось распознать голосовое сообщение.")
-
-
-# 3. Документы
-@bot.message_handler(content_types=["document"])
-def handle_document(message):
-    is_private = message.chat.type == "private"
-    is_reply_to_bot = (
-        message.reply_to_message is not None
-        and message.reply_to_message.from_user.id == bot_info.id
-    )
-    caption = (message.caption or "").lower()
-    is_name = any(n in caption for n in ["gemini", "гемини", "геминай"])
-    is_mentioned = f"@{BOT_NAME}" in caption
-
-    if not is_private and not (is_reply_to_bot or is_mentioned or is_name):
-        return
-
-    bot.send_chat_action(message.chat.id, "typing")
-    user = message.from_user
-    username_tag = f"@{user.username}" if user.username else user.first_name
-
-    try:
-        file_info = bot.get_file(message.document.file_id)
-        file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_info.file_path}"
-        doc_bytes = requests.get(file_url).content
-        b64_doc = base64.b64encode(doc_bytes).decode("utf-8")
-        mime = message.document.mime_type or "application/pdf"
-    except Exception:
-        bot.reply_to(message, "Не удалось прочитать файл.")
-        return
-
-    prompt = (
-        message.caption or "Изучи этот документ и подробно ответь, о чем он."
-    )
-    parts_data = [
-        {"text": f"Пользователь {username_tag} отправил файл. Вопрос: {prompt}"},
-        {"inlineData": {"mimeType": mime, "data": b64_doc}},
-    ]
-    data = {
-        "systemInstruction": {"parts": [{"text": MATH_INSTRUCTION}]},
-        "contents": [{"role": "user", "parts": parts_data}],
-    }
-
-    for model in TEXT_MODELS:
-        try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
-            res = requests.post(url, json=data, timeout=30).json()
-            if "candidates" in res:
-                answer = res["candidates"][0]["content"]["parts"][0]["text"]
-                wait_slow_mode(message.chat.id)
-                clean_ans = clean_latex(answer)
-                bot.reply_to(message, f"{username_tag} {clean_ans}")
-                active_sessions[message.chat.id] = {
-                    "user_id": user.id,
-                    "expires_at": time.time() + ACTIVE_SESSION_SECONDS,
-                }
-                return
-        except Exception:
-            continue
-    bot.reply_to(message, "Не удалось обработать документ.")
-
-
-# 4. ФОТОГРАФИИ
-@bot.message_handler(content_types=["photo"])
-def handle_photo(message):
-    last_chat_photo[message.chat.id] = {
-        "file_id": message.photo[-1].file_id,
-        "time": time.time(),
-    }
-
-    is_private = message.chat.type == "private"
-    is_reply_to_bot = (
-        message.reply_to_message is not None
-        and message.reply_to_message.from_user.id == bot_info.id
-    )
-    caption = (message.caption or "").lower()
-    is_name = any(n in caption for n in ["gemini", "гемини", "геминай"])
-    is_mentioned = f"@{BOT_NAME}" in caption
-
-    if not is_private and not (is_reply_to_bot or is_mentioned or is_name):
-        return
-
-    bot.send_chat_action(message.chat.id, "typing")
-    user = message.from_user
-    username_tag = f"@{user.username}" if user.username else user.first_name
-    prompt = message.caption or "Опиши подробно, что на фото / реши задачу."
-
-    ans = solve_image_task(message.photo[-1].file_id, prompt, username_tag)
-    wait_slow_mode(message.chat.id)
-    bot.reply_to(message, f"{username_tag} {ans}")
-    active_sessions[message.chat.id] = {
-        "user_id": user.id,
-        "expires_at": time.time() + ACTIVE_SESSION_SECONDS,
-    }
-
-
-# 5. ТЕКСТОВЫЕ ОТВЕТЫ
-@bot.message_handler(func=lambda msg: True)
-def answer_text(message):
-    if not message.text:
-        return
-
-    user = message.from_user
-    username_tag = f"@{user.username}" if user.username else user.first_name
-    text_lower = message.text.lower()
-    now = time.time()
-    chat_id = message.chat.id
-    is_private = message.chat.type == "private"
-
-    # Расшифровка ГС друга
-    if message.reply_to_message and (
-        message.reply_to_message.voice or message.reply_to_message.audio
+def on_voice(m):
+    if m.chat.type != "private" and not (
+        m.reply_to_message and m.reply_to_message.from_user.id == bot.get_me().id
     ):
-        triggers = [
-            "расшифруй",
-            "текст",
-            "в текст",
-            "что сказал",
-            "переведи",
-            "gemini",
-            "гемини",
-        ]
-        if any(tr in text_lower for tr in triggers):
-            bot.send_chat_action(chat_id, "typing")
-            target_voice = (
-                message.reply_to_message.voice or message.reply_to_message.audio
-            )
-            friend = message.reply_to_message.from_user
-            friend_tag = (
-                f"@{friend.username}" if friend.username else friend.first_name
-            )
-
-            try:
-                file_info = bot.get_file(target_voice.file_id)
-                file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_info.file_path}"
-                audio_bytes = requests.get(file_url).content
-                b64_audio = base64.b64encode(audio_bytes).decode("utf-8")
-
-                text_result = transcribe_audio_bytes(b64_audio)
-                if text_result:
-                    wait_slow_mode(chat_id)
-                    reply_text = f"🎤 **Расшифровка для {friend_tag}:**\n\n«{text_result.strip()}»"
-                    bot.reply_to(message.reply_to_message, reply_text)
-                    return
-            except Exception:
-                bot.reply_to(
-                    message, "Не удалось прослушать голосовое друга 😢"
-                )
-                return
-
-    # Сессия диалога
-    session = active_sessions.get(chat_id)
-    is_in_active_session = False
-
-    if session:
-        if now < session["expires_at"]:
-            if (
-                message.reply_to_message
-                and message.reply_to_message.from_user.id != bot_info.id
-            ):
-                active_sessions.pop(chat_id, None)
-                is_in_active_session = False
-            elif any(
-                w in text_lower
-                for w in [
-                    "пацаны",
-                    "парни",
-                    "го в ",
-                    "гоу в ",
-                    "илья",
-                    "серёга",
-                    "женя",
-                ]
-            ):
-                active_sessions.pop(chat_id, None)
-                is_in_active_session = False
-            else:
-                is_in_active_session = True
-        else:
-            active_sessions.pop(chat_id, None)
-
-    stop_words = ["отбой", "хватит", "молчи", "стоп", "пока", "все спасибо"]
-    if is_in_active_session and any(w in text_lower for w in stop_words):
-        active_sessions.pop(chat_id, None)
-        wait_slow_mode(chat_id)
-        bot.reply_to(message, f"{username_tag} Понял, не мешаю разговору! 👍")
         return
-
-    is_reply_to_bot = (
-        message.reply_to_message is not None
-        and message.reply_to_message.from_user.id == bot_info.id
-    )
-    is_mentioned = f"@{BOT_NAME}" in text_lower
-    is_name_called = any(
-        n in text_lower for n in ["gemini", "гемини", "геминай"]
-    )
-    is_command = message.text.startswith("/ask") or message.text.startswith(
-        "/ai"
-    )
-    is_reply_to_any_photo = bool(
-        message.reply_to_message and message.reply_to_message.photo
-    )
-
-    should_respond = (
-        is_private
-        or is_reply_to_bot
-        or is_mentioned
-        or is_command
-        or is_name_called
-        or is_in_active_session
-        or is_reply_to_any_photo
-    )
-
-    if not is_private and not should_respond:
-        return
-
-    clean_text = message.text
-    for prefix in [
-        f"@{bot_info.username}",
-        f"@{BOT_NAME}",
-        "/ask",
-        "/ai",
-        "gemini",
-        "гемини",
-        "геминай",
-        "Gemini",
-        "Гемини",
-    ]:
-        clean_text = re.sub(
-            re.escape(prefix), "", clean_text, flags=re.IGNORECASE
+    bot.send_chat_action(m.chat.id, "typing")
+    try:
+        f = requests.get(
+            f"https://api.telegram.org/file/bot{TOKEN}/{bot.get_file((m.voice or m.audio).file_id).file_path}"
+        ).content
+        b64 = base64.b64encode(f).decode("utf-8")
+        d = {
+            "contents": [{
+                "role": "user",
+                "parts": [
+                    {"text": "Дословно переведи в текст без комментариев."},
+                    {"inlineData": {"mimeType": "audio/ogg", "data": b64}},
+                ],
+            }]
+        }
+        ans = ask_gemini(d, 25)
+        wait_slow(m.chat.id)
+        bot.reply_to(
+            m, f"@{m.from_user.username or m.from_user.first_name} {ans}"
         )
-    clean_text = clean_text.strip(" ,:.-?!")
+    except:
+        bot.reply_to(m, "Не удалось прослушать аудио.")
 
-    if not clean_text:
-        bot.reply_to(message, f"{username_tag} Я тут! Чем помочь?")
+
+@bot.message_handler(content_types=["photo", "document"])
+def on_media(m):
+    cid = m.chat.id
+    if m.photo:
+        last_photo[cid] = {"id": m.photo[-1].file_id, "t": time.time()}
+    cap = (m.caption or "").lower()
+    is_call = (
+        any(x in cap for x in ["gemini", "гемини"])
+        or f"@{bot_name}" in cap
+        or (
+            m.reply_to_message
+            and m.reply_to_message.from_user.id == bot.get_me().id
+        )
+    )
+    if m.chat.type != "private" and not is_call:
+        return
+    bot.send_chat_action(cid, "typing")
+    u_tag = f"@{m.from_user.username or m.from_user.first_name}"
+    try:
+        fid = m.photo[-1].file_id if m.photo else m.document.file_id
+        mime = (
+            "image/jpeg" if m.photo else (m.document.mime_type or "application/pdf")
+        )
+        f = requests.get(
+            f"https://api.telegram.org/file/bot{TOKEN}/{bot.get_file(fid).file_path}"
+        ).content
+        b64 = base64.b64encode(f).decode("utf-8")
+        p = m.caption or "Опиши подробно или реши задачу."
+        d = {
+            "systemInstruction": {"parts": [{"text": MATH_RULE}]},
+            "contents": [{
+                "role": "user",
+                "parts": [
+                    {"text": f"{u_tag}: {p}"},
+                    {"inlineData": {"mimeType": mime, "data": b64}},
+                ],
+            }],
+        }
+        ans = ask_gemini(d, 30)
+        wait_slow(cid)
+        bot.reply_to(m, f"{u_tag} {ans}")
+        sessions[cid] = {"u": m.from_user.id, "exp": time.time() + 90}
+    except:
+        bot.reply_to(m, "Не удалось обработать файл/фото.")
+
+
+@bot.message_handler(func=lambda m: True)
+def on_text(m):
+    if not m.text:
+        return
+    cid, uid, txt, now = m.chat.id, m.from_user.id, m.text, time.time()
+    u_tag = f"@{m.from_user.username or m.from_user.first_name}"
+    low = txt.lower()
+
+    if (
+        m.reply_to_message
+        and (m.reply_to_message.voice or m.reply_to_message.audio)
+        and any(
+            x in low
+            for x in ["расшифруй", "текст", "что сказал", "гемини", "gemini"]
+        )
+    ):
+        bot.send_chat_action(cid, "typing")
+        try:
+            f = requests.get(
+                f"https://api.telegram.org/file/bot{TOKEN}/{bot.get_file((m.reply_to_message.voice or m.reply_to_message.audio).file_id).file_path}"
+            ).content
+            b64 = base64.b64encode(f).decode("utf-8")
+            d = {
+                "contents": [{
+                    "role": "user",
+                    "parts": [
+                        {"text": "Дословно переведи в текст без комментариев."},
+                        {"inlineData": {"mimeType": "audio/ogg", "data": b64}},
+                    ],
+                }]
+            }
+            ans = ask_gemini(d, 25)
+            wait_slow(cid)
+            fr = m.reply_to_message.from_user
+            bot.reply_to(
+                m.reply_to_message,
+                f"🎤 Расшифровка для @{fr.username or fr.first_name}:\n\n«{ans.strip()}»",
+            )
+            return
+        except:
+            return bot.reply_to(m, "Ошибка при расшифровке.")
+
+    in_sess = False
+    sess = sessions.get(cid)
+    if sess and now < sess["exp"]:
+        if (
+            m.reply_to_message
+            and m.reply_to_message.from_user.id != bot.get_me().id
+        ):
+            sessions.pop(cid, None)
+        elif any(
+            x in low
+            for x in [
+                "пацаны",
+                "парни",
+                "го в ",
+                "гоу в ",
+                "илья",
+                "серёга",
+                "женя",
+            ]
+        ):
+            sessions.pop(cid, None)
+        else:
+            in_sess = True
+    else:
+        sessions.pop(cid, None)
+
+    if in_sess and any(
+        x in low for x in ["отбой", "хватит", "молчи", "стоп", "пока", "спасибо"]
+    ):
+        sessions.pop(cid, None)
+        return bot.reply_to(m, f"{u_tag} Понял, не мешаю!")
+
+    is_call = (
+        m.chat.type == "private"
+        or in_sess
+        or any(x in low for x in ["gemini", "гемини", "геминай"])
+        or f"@{bot_name}" in low
+        or m.text.startswith(("/ask", "/ai"))
+        or (
+            m.reply_to_message
+            and m.reply_to_message.from_user.id == bot.get_me().id
+        )
+        or bool(m.reply_to_message and m.reply_to_message.photo)
+    )
+    if not is_call:
         return
 
-    # Подтягивание фото
-    target_photo_id = None
-    if message.reply_to_message and message.reply_to_message.photo:
-        target_photo_id = message.reply_to_message.photo[-1].file_id
-    elif any(
-        w in text_lower
-        for w in [
+    for x in ["gemini", "гемини", "геминай", f"@{bot_name}", "/ask", "/ai"]:
+        txt = re.sub(re.escape(x), "", txt, flags=re.IGNORECASE).strip(
+            " ,:.-?!"
+        )
+
+    for trig in [
+        "нарисуй",
+        "сгенерируй",
+        "сделай картинку",
+        "сделай фото",
+        "изобрази",
+        "создай фото",
+        "создай арт",
+        "draw",
+    ]:
+        if low.startswith(trig):
+            prompt = txt[len(trig) :].strip(" :,-")
+            if prompt:
+                return send_art(cid, prompt, m.message_id)
+
+    target_pid = (
+        m.reply_to_message.photo[-1].file_id
+        if (m.reply_to_message and m.reply_to_message.photo)
+        else None
+    )
+    if not target_pid and any(
+        x in low
+        for x in [
             "фото",
             "фотк",
             "картинк",
@@ -491,5 +322,71 @@ def answer_text(message):
             "пример",
             "задач",
             "снимок",
-            "рисунок",
-            "уравнени",
+        ]
+    ):
+        lp = last_photo.get(cid)
+        if lp and (now - lp["t"] < 1200):
+            target_pid = lp["id"]
+
+    if target_pid:
+        bot.send_chat_action(cid, "typing")
+        try:
+            f = requests.get(
+                f"https://api.telegram.org/file/bot{TOKEN}/{bot.get_file(target_pid).file_path}"
+            ).content
+            b64 = base64.b64encode(f).decode("utf-8")
+            d = {
+                "systemInstruction": {"parts": [{"text": MATH_RULE}]},
+                "contents": [{
+                    "role": "user",
+                    "parts": [
+                        {"text": f"{u_tag}: {txt or 'Реши задачу с фото'}"},
+                        {"inlineData": {"mimeType": "image/jpeg", "data": b64}},
+                    ],
+                }],
+            }
+            ans = ask_gemini(d, 25)
+            wait_slow(cid)
+            bot.reply_to(m, f"{u_tag} {ans}")
+            sessions[cid] = {"u": uid, "exp": now + 90}
+            return
+        except:
+            pass
+
+    if not txt:
+        return bot.reply_to(m, f"{u_tag} Я тут! Чем помочь?")
+
+    bot.send_chat_action(cid, "typing")
+    mem = memory.get(cid, {})
+    if now - mem.get("t", 0) > 600:
+        mem = {"t": now, "msgs": []}
+    mem["t"] = now
+    hist = mem.get("msgs", [])
+
+    new_msg = {"role": "user", "parts": [{"text": f"{u_tag}: {txt}"}]}
+    d = {
+        "systemInstruction": {"parts": [{"text": MATH_RULE}]},
+        "contents": hist + [new_msg],
+    }
+    ans = ask_gemini(d, 15)
+
+    wait_slow(cid)
+    bot.reply_to(m, f"{u_tag} {ans}")
+    sessions[cid] = {"u": uid, "exp": now + 90}
+
+    hist.append(new_msg)
+    hist.append(
+        {"role": "model", "parts": [{"text": f"Ответ для {u_tag}: {ans}"}]}
+    )
+    mem["msgs"] = hist[-20:]
+    memory[cid] = mem
+
+
+if __name__ == "__main__":
+    threading.Thread(
+        target=lambda: bot.infinity_polling(
+            timeout=20, long_polling_timeout=10
+        ),
+        daemon=True,
+    ).start()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
