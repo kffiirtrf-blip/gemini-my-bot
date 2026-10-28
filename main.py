@@ -31,7 +31,6 @@ BOT_NAME = bot_info.username.lower()
 chat_memory = {}
 last_send_time = {}
 active_sessions = {}
-# Кэш последних фото в чатах: {chat_id: {"file_id": str, "time": float}}
 last_chat_photo = {}
 
 app = Flask(__name__)
@@ -135,7 +134,6 @@ def transcribe_audio_bytes(b64_audio):
 
 
 def solve_image_task(file_id, prompt, username_tag):
-    """Анализирует фото через Gemini"""
     try:
         file_info = bot.get_file(file_id)
         file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_info.file_path}"
@@ -304,10 +302,9 @@ def handle_document(message):
     bot.reply_to(message, "Не удалось обработать документ.")
 
 
-# 4. ФОТОГРАФИИ (Всегда молча кэшируем в память чата!)
+# 4. ФОТОГРАФИИ
 @bot.message_handler(content_types=["photo"])
 def handle_photo(message):
-    # Запоминаем последнее фото в этом чате на 20 минут
     last_chat_photo[message.chat.id] = {
         "file_id": message.photo[-1].file_id,
         "time": time.time(),
@@ -322,7 +319,6 @@ def handle_photo(message):
     is_name = any(n in caption for n in ["gemini", "гемини", "геминай"])
     is_mentioned = f"@{BOT_NAME}" in caption
 
-    # Если фото прислали без обращения к боту — просто оставляем в кэше и молчим
     if not is_private and not (is_reply_to_bot or is_mentioned or is_name):
         return
 
@@ -340,7 +336,7 @@ def handle_photo(message):
     }
 
 
-# 5. ТЕКСТОВЫЕ ОТВЕТЫ (УМЕЕТ ПОДТЯГИВАТЬ СТАРЫЕ ФОТО ИЗ ЧАТА!)
+# 5. ТЕКСТОВЫЕ ОТВЕТЫ
 @bot.message_handler(func=lambda msg: True)
 def answer_text(message):
     if not message.text:
@@ -353,7 +349,7 @@ def answer_text(message):
     chat_id = message.chat.id
     is_private = message.chat.type == "private"
 
-    # 🎙️ Расшифровка ГС друга
+    # Расшифровка ГС друга
     if message.reply_to_message and (
         message.reply_to_message.voice or message.reply_to_message.audio
     ):
@@ -394,7 +390,7 @@ def answer_text(message):
                 )
                 return
 
-    # 🛑 Сессия живого диалога
+    # Сессия диалога
     session = active_sessions.get(chat_id)
     is_in_active_session = False
 
@@ -443,8 +439,6 @@ def answer_text(message):
     is_command = message.text.startswith("/ask") or message.text.startswith(
         "/ai"
     )
-
-    # Если человек ответил реплаем на ЛЮБОЕ ФОТО в чате со словами "реши" или "гемини"
     is_reply_to_any_photo = bool(
         message.reply_to_message and message.reply_to_message.photo
     )
@@ -483,14 +477,10 @@ def answer_text(message):
         bot.reply_to(message, f"{username_tag} Я тут! Чем помочь?")
         return
 
-    # 🖼️ ПРОВЕРКА: Нужно ли подтянуть фото к этому текстовому вопросу?
+    # Подтягивание фото
     target_photo_id = None
-
-    # Вариант 1: Свайпнули на сообщение с фото
     if message.reply_to_message and message.reply_to_message.photo:
         target_photo_id = message.reply_to_message.photo[-1].file_id
-
-    # Вариант 2: Пишут «с фотки выше», «на картинке», «задачу на фото»
     elif any(
         w in text_lower
         for w in [
@@ -503,87 +493,3 @@ def answer_text(message):
             "снимок",
             "рисунок",
             "уравнени",
-        ]
-    ):
-        last_photo_info = last_chat_photo.get(chat_id)
-        if last_photo_info and (now - last_photo_info["time"] < 1200):  # 20 мин
-            target_photo_id = last_photo_info["file_id"]
-
-    # ЕСЛИ НАШЛИ ФОТО — РЕШАЕМ ЕГО ЧЕРЕЗ ЗРЕНИЕ GEMINI:
-    if target_photo_id:
-        bot.send_chat_action(chat_id, "typing")
-        prompt = (
-            clean_text
-            or "Реши и подробно распиши все математические шаги с этого фото."
-        )
-        ans = solve_image_task(target_photo_id, prompt, username_tag)
-        wait_slow_mode(chat_id)
-        bot.reply_to(message, f"{username_tag} {ans}")
-        active_sessions[chat_id] = {
-            "user_id": user.id,
-            "expires_at": now + ACTIVE_SESSION_SECONDS,
-        }
-        return
-
-    # Генерация картинок по тексту
-    lower = clean_text.lower()
-    draw_triggers = [
-        "нарисуй мне",
-        "нарисуй",
-        "сгенерируй картинку",
-        "сгенерируй фото",
-        "сгенерируй арт",
-        "сгенерируй",
-        "сделай картинку",
-        "сделай фото",
-        "изобрази",
-        "создай фото",
-        "создай арт",
-        "draw",
-    ]
-    for trigger in draw_triggers:
-        if lower.startswith(trigger):
-            art_prompt = clean_text[len(trigger) :].strip(" :,-")
-            if art_prompt:
-                generate_free_art(chat_id, art_prompt, message.message_id)
-                return
-
-    # Обычный текстовый диалог
-    bot.send_chat_action(chat_id, "typing")
-    history = get_or_reset_memory(chat_id)
-
-    tagged_message = (
-        f"Пользователь {username_tag} ({user.first_name}) пишет: {clean_text}"
-    )
-    new_user_message = {"role": "user", "parts": [{"text": tagged_message}]}
-
-    data = {
-        "systemInstruction": {"parts": [{"text": MATH_INSTRUCTION}]},
-        "contents": history + [new_user_message],
-    }
-
-    for model in TEXT_MODELS:
-        try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
-            response = requests.post(url, json=data, timeout=12)
-            res = response.json()
-
-            if "candidates" in res:
-                answer = res["candidates"][0]["content"]["parts"][0]["text"]
-                wait_slow_mode(chat_id)
-
-                clean_ans = clean_latex(answer)
-                clean_reply = f"{username_tag} {clean_ans}"
-                bot.reply_to(message, clean_reply)
-
-                active_sessions[chat_id] = {
-                    "user_id": user.id,
-                    "expires_at": now + ACTIVE_SESSION_SECONDS,
-                }
-
-                history.append(new_user_message)
-                history.append(
-                    {
-                        "role": "model",
-                        "parts": [
-                   
