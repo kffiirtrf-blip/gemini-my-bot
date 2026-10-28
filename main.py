@@ -7,7 +7,6 @@ from flask import Flask
 import requests
 import telebot
 
-# Бот берет секретный ключ безопасно из настроек сервера
 TELEGRAM_TOKEN = "9129090353:AAFOZU4NEVz1SzXow8JQe5CIx1a0sSam19I"
 GEMINI_KEY = os.environ.get("GEMINI_KEY", "")
 
@@ -16,6 +15,7 @@ TIMEOUT_SECONDS = 600  # 10 минут памяти
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 bot_info = bot.get_me()
+BOT_NAME = bot_info.username.lower()
 
 chat_memory = {}
 app = Flask(__name__)
@@ -37,7 +37,7 @@ def get_or_reset_memory(chat_id):
     return chat_memory[chat_id]["messages"]
 
 
-# 1. История /history
+# 1. История диалога
 @bot.message_handler(commands=["history"])
 def show_history(message):
     messages = get_or_reset_memory(message.chat.id)
@@ -55,14 +55,14 @@ def show_history(message):
     bot.reply_to(message, text_history)
 
 
-# 2. Сброс /clear
+# 2. Очистить память
 @bot.message_handler(commands=["clear", "reset"])
 def clear_memory(message):
     chat_memory[message.chat.id] = {"last_time": time.time(), "messages": []}
-    bot.reply_to(message, "🧹 Память очищена! Начинаем заново.")
+    bot.reply_to(message, "🧹 Память диалога сброшена!")
 
 
-# 3. Картинки /img
+# 3. Картинки (/img)
 @bot.message_handler(commands=["img", "pic", "image"])
 def generate_image(message):
     parts = message.text.split(maxsplit=1)
@@ -88,12 +88,26 @@ def generate_image(message):
         bot.reply_to(message, f"Ошибка загрузки картинки: {err}")
 
 
-# 4. Распознавание ФОТО
+# 4. Распознавание ФОТО (в группе — только если тегнули или ответили боту)
 @bot.message_handler(content_types=["photo"])
 def handle_photo(message):
+    is_private = message.chat.type == "private"
+    is_reply_to_bot = (
+        message.reply_to_message is not None
+        and message.reply_to_message.from_user.id == bot_info.id
+    )
+    caption = message.caption or ""
+    is_mentioned = f"@{BOT_NAME}" in caption.lower()
+
+    # В группе игнорируем чужие фото, если к боту не обратились
+    if not is_private and not (is_reply_to_bot or is_mentioned):
+        return
+
     bot.send_chat_action(message.chat.id, "typing")
-    caption = message.caption or "Опиши подробно, что изображено на этом фото."
-    caption = caption.replace(f"@{bot_info.username}", "").strip()
+    clean_caption = (
+        caption.replace(f"@{bot_info.username}", "").replace(f"@{BOT_NAME}", "")
+    ).strip()
+    clean_caption = clean_caption or "Опиши подробно, что изображено на фото."
 
     try:
         file_info = bot.get_file(message.photo[-1].file_id)
@@ -105,7 +119,7 @@ def handle_photo(message):
         return
 
     parts_data = [
-        {"text": caption},
+        {"text": clean_caption},
         {"inlineData": {"mimeType": "image/jpeg", "data": b64_image}},
     ]
     data = {"contents": [{"role": "user", "parts": parts_data}]}
@@ -120,7 +134,10 @@ def handle_photo(message):
                 bot.reply_to(message, answer)
                 mem = get_or_reset_memory(message.chat.id)
                 mem.append(
-                    {"role": "user", "parts": [{"text": f"[Фото]: {caption}"}]}
+                    {
+                        "role": "user",
+                        "parts": [{"text": f"[Фото]: {clean_caption}"}],
+                    }
                 )
                 mem.append({"role": "model", "parts": [{"text": answer}]})
                 return
@@ -130,18 +147,36 @@ def handle_photo(message):
     bot.reply_to(message, "Не удалось распознать фото через Google.")
 
 
-# 5. Текстовые ответы с памятью
+# 5. Текстовые ответы (ТОЛЬКО НА РЕПЛАИ ИЛИ ТЕГИ В ГРУППЕ)
 @bot.message_handler(func=lambda msg: True)
 def answer_text(message):
     if not message.text:
         return
 
-    clean_text = message.text.replace(f"@{bot_info.username}", "")
+    is_private = message.chat.type == "private"
+    is_reply_to_bot = (
+        message.reply_to_message is not None
+        and message.reply_to_message.from_user.id == bot_info.id
+    )
+    is_mentioned = f"@{BOT_NAME}" in message.text.lower()
+    is_command = message.text.startswith("/ask") or message.text.startswith(
+        "/ai"
+    )
+
+    # 🛑 В ГРУППЕ МОЛЧИМ, если это не ответ на сообщение бота и не тег!
+    if not is_private and not (is_reply_to_bot or is_mentioned or is_command):
+        return
+
+    clean_text = (
+        message.text.replace(f"@{bot_info.username}", "")
+        .replace(f"@{BOT_NAME}", "")
+        .strip()
+    )
     if clean_text.startswith("/ask") or clean_text.startswith("/ai"):
-        clean_text = clean_text.split(maxsplit=1)[-1]
-    clean_text = clean_text.strip()
+        clean_text = clean_text.split(maxsplit=1)[-1].strip()
 
     if not clean_text:
+        bot.reply_to(message, "Я тут! Чем помочь?")
         return
 
     bot.send_chat_action(message.chat.id, "typing")
@@ -149,8 +184,6 @@ def answer_text(message):
 
     new_user_message = {"role": "user", "parts": [{"text": clean_text}]}
     data = {"contents": history + [new_user_message]}
-
-    last_error_text = "Сервера Google перегружены"
 
     for model in MODELS:
         try:
@@ -169,13 +202,10 @@ def answer_text(message):
                 if len(history) > 20:
                     chat_memory[message.chat.id]["messages"] = history[-20:]
                 return
-            elif "error" in res:
-                last_error_text = f"[{model}]: {res['error']['message']}"
-        except Exception as e:
-            last_error_text = f"Сетевая ошибка: {e}"
+        except Exception:
             continue
 
-    bot.reply_to(message, f"⚠️ Ошибка:\n{last_error_text}")
+    bot.reply_to(message, "Сервера Google заняты, попробуй еще раз!")
 
 
 def run_telebot():
