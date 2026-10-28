@@ -3,7 +3,6 @@ import io
 import os
 import threading
 import time
-import urllib.parse
 from flask import Flask
 import requests
 import telebot
@@ -11,20 +10,17 @@ import telebot
 TELEGRAM_TOKEN = "9129090353:AAFOZU4NEVz1SzXow8JQe5CIx1a0sSam19I"
 GEMINI_KEY = os.environ.get("GEMINI_KEY", "")
 
+# Модели Google
 TEXT_MODELS = ["gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-3.5-flash"]
-IMAGE_MODEL = "gemini-nano-banana-2.1"
-TIMEOUT_SECONDS = 600  # 10 минут памяти диалога
+NANO_BANANA_MODELS = ["gemini-nano-banana-2.1", "gemini-3.1-flash-image"]
+TIMEOUT_SECONDS = 600
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 bot_info = bot.get_me()
 BOT_NAME = bot_info.username.lower()
 
-# Память текущих диалогов
 chat_memory = {}
-
-# Досье на участников чата: {user_id: {"name": str, "facts": list}}
 user_dossier = {}
-
 app = Flask(__name__)
 
 
@@ -45,7 +41,6 @@ def get_or_reset_memory(chat_id):
 
 
 def update_user_dossier(user, text):
-    """Пассивно запоминает сообщения участников чата для досье"""
     uid = user.id
     name = user.first_name or "Друг"
     if uid not in user_dossier:
@@ -56,58 +51,72 @@ def update_user_dossier(user, text):
             user_dossier[uid]["recent_lines"].pop(0)
 
 
-# 1. Генерация картинок через Google Nano Banana 2.1
+# 🍌 Генерация ИСКЛЮЧИТЕЛЬНО через Google Nano Banana
+def generate_nano_banana(chat_id, prompt, reply_to_id=None):
+    bot.send_message(
+        chat_id,
+        "🍌 Gemini Nano Banana 2.1 генерирует арт, подождите...",
+        reply_to_message_id=reply_to_id,
+    )
+
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "responseModalities": ["IMAGE"],
+            "imageConfig": {"aspectRatio": "1:1", "imageSize": "1K"},
+        },
+    }
+
+    last_error = "Не удалось сгенерировать изображение."
+
+    for model in NANO_BANANA_MODELS:
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
+            res = requests.post(url, json=payload, timeout=50).json()
+
+            if "error" in res:
+                last_error = f"[{model}]: {res['error']['message']}"
+                continue
+
+            for candidate in res.get("candidates", []):
+                for part in candidate.get("content", {}).get("parts", []):
+                    if "inlineData" in part:
+                        img_bytes = base64.b64decode(part["inlineData"]["data"])
+                        img_file = io.BytesIO(img_bytes)
+                        img_file.name = "banana_art.jpg"
+
+                        bot.send_photo(
+                            chat_id,
+                            img_file,
+                            caption=f"🍌 Nano Banana 2.1:\n✨ {prompt}",
+                            reply_to_message_id=reply_to_id,
+                        )
+                        return
+        except Exception as e:
+            last_error = f"Ошибка сети: {e}"
+            continue
+
+    bot.send_message(
+        chat_id,
+        f"⚠️ Ошибка Nano Banana:\n{last_error}",
+        reply_to_message_id=reply_to_id,
+    )
+
+
+# 1. Генерация картинок по команде /img
 @bot.message_handler(commands=["img", "pic", "image", "banana"])
-def generate_image(message):
+def cmd_image(message):
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
         bot.reply_to(
             message,
-            "Напиши, что нарисовать. Пример:\n/img неоновый банан в космосе",
+            "Напиши, что нарисовать. Пример:\n/img желтый спорткар ночью",
         )
         return
-
-    user_prompt = parts[1]
-    bot.reply_to(message, "🍌 Nano Banana 2.1 генерирует шедевр...")
-
-    # Попытка №1: Официальный Google Nano Banana 2.1
-    try:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{IMAGE_MODEL}:generateContent?key={GEMINI_KEY}"
-        payload = {
-            "contents": [{"parts": [{"text": user_prompt}]}],
-            "generationConfig": {"responseModalities": ["IMAGE"]},
-        }
-        res = requests.post(url, json=payload, timeout=30).json()
-
-        for candidate in res.get("candidates", []):
-            for part in candidate.get("content", {}).get("parts", []):
-                if "inlineData" in part:
-                    img_data = base64.b64decode(part["inlineData"]["data"])
-                    bot.send_photo(
-                        message.chat.id,
-                        io.BytesIO(img_data),
-                        caption=f"🍌 Nano Banana 2.1:\n✨ {user_prompt}",
-                        reply_to_message_id=message.message_id,
-                    )
-                    return
-    except Exception:
-        pass
-
-    # Попытка №2 (Запасная): Бесплатный скоростной шлюз
-    try:
-        encoded = urllib.parse.quote(user_prompt)
-        image_url = f"https://image.pollinations.ai/prompt/{encoded}"
-        bot.send_photo(
-            message.chat.id,
-            image_url,
-            caption=f"✨ {user_prompt}",
-            reply_to_message_id=message.message_id,
-        )
-    except Exception as err:
-        bot.reply_to(message, f"Ошибка создания арта: {err}")
+    generate_nano_banana(message.chat.id, parts[1], message.message_id)
 
 
-# 2. История диалога
+# 2. История диалога /history
 @bot.message_handler(commands=["history"])
 def show_history(message):
     messages = get_or_reset_memory(message.chat.id)
@@ -125,7 +134,7 @@ def show_history(message):
     bot.reply_to(message, text_history)
 
 
-# 3. Сброс памяти
+# 3. Сброс памяти /clear
 @bot.message_handler(commands=["clear", "reset"])
 def clear_memory(message):
     chat_memory[message.chat.id] = {"last_time": time.time(), "messages": []}
@@ -190,14 +199,13 @@ def handle_photo(message):
     bot.reply_to(message, "Ошибка распознавания фото.")
 
 
-# 5. Текстовые ответы с памятью и досье на друзей
+# 5. Текстовые ответы + Генерация по обычному тексту
 @bot.message_handler(func=lambda msg: True)
 def answer_text(message):
     if not message.text:
         return
 
     user = message.from_user
-    # Пассивно обновляем досье на каждого участника группы
     update_user_dossier(user, message.text)
 
     is_private = message.chat.type == "private"
@@ -210,7 +218,6 @@ def answer_text(message):
         "/ai"
     )
 
-    # В группе отвечаем ТОЛЬКО на реплай или тег
     if not is_private and not (is_reply_to_bot or is_mentioned or is_command):
         return
 
@@ -226,19 +233,45 @@ def answer_text(message):
         bot.reply_to(message, "Я тут! Чем помочь?")
         return
 
+    # 🎨 Проверяем, просит ли человек нарисовать обычным текстом
+    lower = clean_text.lower()
+    draw_triggers = [
+        "нарисуй мне",
+        "нарисуй",
+        "сгенерируй картинку",
+        "сгенерируй фото",
+        "сгенерируй арт",
+        "сгенерируй",
+        "сделай картинку",
+        "сделай фото",
+        "сделай изображение",
+        "изобрази",
+        "создай картинку",
+        "создай фото",
+        "создай арт",
+        "draw",
+    ]
+    for trigger in draw_triggers:
+        if lower.startswith(trigger):
+            art_prompt = clean_text[len(trigger) :].strip(" :,-")
+            if art_prompt:
+                # Отправляем только в Nano Banana!
+                generate_nano_banana(
+                    message.chat.id, art_prompt, message.message_id
+                )
+                return
+
+    # Если обычный диалог — отвечает текстовый Gemini
     bot.send_chat_action(message.chat.id, "typing")
     history = get_or_reset_memory(message.chat.id)
 
-    # Инструкция: кто обращается к боту и что бот о нем знает
     dossier = user_dossier.get(user.id, {})
     notes = ", ".join(dossier.get("recent_lines", []))
-    system_hint = (
-        f"Ты общаешься с участником чата по имени {user.first_name}. "
-    )
+    system_hint = f"Собеседник: {user.first_name}. "
     if notes:
-        system_hint += f"Ранее в чате он говорил: {notes}. "
+        system_hint += f"Ранее он писал в чате: {notes}. "
 
-    user_query = f"[Справка: {system_hint}]\nВопрос от {user.first_name}: {clean_text}"
+    user_query = f"[Справка: {system_hint}]\nВопрос: {clean_text}"
     new_user_message = {"role": "user", "parts": [{"text": user_query}]}
     data = {"contents": history + [new_user_message]}
 
@@ -251,7 +284,6 @@ def answer_text(message):
             if "candidates" in res:
                 answer = res["candidates"][0]["content"]["parts"][0]["text"]
                 bot.reply_to(message, answer)
-
                 history.append(
                     {"role": "user", "parts": [{"text": clean_text}]}
                 )
@@ -264,7 +296,7 @@ def answer_text(message):
         except Exception:
             continue
 
-    bot.reply_to(message, "Сервера заняты, повтори через пару секунд!")
+    bot.reply_to(message, "Сервера Google заняты, повтори через пару секунд!")
 
 
 def run_telebot():
