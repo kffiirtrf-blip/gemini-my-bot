@@ -12,8 +12,8 @@ TELEGRAM_TOKEN = "9129090353:AAFOZU4NEVz1SzXow8JQe5CIx1a0sSam19I"
 GEMINI_KEY = os.environ.get("GEMINI_KEY", "")
 
 TEXT_MODELS = ["gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-3.5-flash"]
-TIMEOUT_SECONDS = 600  # 10 минут памяти
-SLOW_MODE_SECONDS = 6  # Медленный режим 6 секунд
+TIMEOUT_SECONDS = 600
+SLOW_MODE_SECONDS = 6
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 bot_info = bot.get_me()
@@ -50,7 +50,7 @@ def get_or_reset_memory(chat_id):
     return chat_memory[chat_id]["messages"]
 
 
-# 🎨 Генерация артов через FLUX (без логотипов)
+# 🎨 Генерация артов через FLUX
 def generate_free_art(chat_id, prompt, reply_to_id=None):
     wait_slow_mode(chat_id)
     bot.send_message(chat_id, "🎨 Рисую арт, подожди секунд 5...")
@@ -69,6 +69,31 @@ def generate_free_art(chat_id, prompt, reply_to_id=None):
         )
     except Exception as err:
         bot.send_message(chat_id, f"Ошибка создания картинки: {err}")
+
+
+# Вспомогательная функция расшифровки аудио
+def transcribe_audio_bytes(b64_audio):
+    parts_data = [
+        {
+            "text": (
+                "Дословно переведи это голосовое сообщение в текст на русском"
+                " языке. Напиши ТОЛЬКО текст того, что сказал человек, без"
+                " лишних комментариев, приветствий и пояснений."
+            )
+        },
+        {"inlineData": {"mimeType": "audio/ogg", "data": b64_audio}},
+    ]
+    data = {"contents": [{"role": "user", "parts": parts_data}]}
+
+    for model in TEXT_MODELS:
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
+            res = requests.post(url, json=data, timeout=25).json()
+            if "candidates" in res:
+                return res["candidates"][0]["content"]["parts"][0]["text"]
+        except Exception:
+            continue
+    return None
 
 
 # 1. Команды /img, /history, /clear
@@ -109,7 +134,7 @@ def clear_memory(message):
     bot.reply_to(message, "🧹 Память диалога очищена!")
 
 
-# 2. Обработка ГОЛОСОВЫХ сообщений
+# 2. Обработка входящих ГОЛОСОВЫХ (напрямую боту)
 @bot.message_handler(content_types=["voice", "audio"])
 def handle_voice(message):
     is_private = message.chat.type == "private"
@@ -118,7 +143,6 @@ def handle_voice(message):
         and message.reply_to_message.from_user.id == bot_info.id
     )
 
-    # В группе слушаем голосовые, если это ответ боту
     if not is_private and not is_reply_to_bot:
         return
 
@@ -136,32 +160,15 @@ def handle_voice(message):
         bot.reply_to(message, "Не удалось загрузить голосовое сообщение.")
         return
 
-    parts_data = [
-        {
-            "text": (
-                f"Пользователь {username_tag} отправил голосовое сообщение."
-                " Расшифруй его и дай полезный ответ на него."
-            )
-        },
-        {"inlineData": {"mimeType": "audio/ogg", "data": b64_audio}},
-    ]
-    data = {"contents": [{"role": "user", "parts": parts_data}]}
-
-    for model in TEXT_MODELS:
-        try:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
-            res = requests.post(url, json=data, timeout=25).json()
-            if "candidates" in res:
-                answer = res["candidates"][0]["content"]["parts"][0]["text"]
-                wait_slow_mode(message.chat.id)
-                bot.reply_to(message, f"{username_tag} {answer}")
-                return
-        except Exception:
-            continue
-    bot.reply_to(message, "Не удалось распознать голосовое сообщение.")
+    answer = transcribe_audio_bytes(b64_audio)
+    if answer:
+        wait_slow_mode(message.chat.id)
+        bot.reply_to(message, f"{username_tag} {answer}")
+    else:
+        bot.reply_to(message, "Не удалось распознать голосовое сообщение.")
 
 
-# 3. Обработка ФАЙЛОВ и ДОКУМЕНТОВ (PDF, TXT и т.д.)
+# 3. Обработка ФАЙЛОВ и ДОКУМЕНТОВ
 @bot.message_handler(content_types=["document"])
 def handle_document(message):
     is_private = message.chat.type == "private"
@@ -272,7 +279,7 @@ def handle_photo(message):
     bot.reply_to(message, "Ошибка распознавания фото.")
 
 
-# 5. Текстовые ответы (РЕАКЦИЯ НА РЕПЛАЙ, ТЕГ И СЛОВО GEMINI)
+# 5. ТЕКСТОВЫЕ ОТВЕТЫ + РАСШИФРОВКА ГС ДРУГА ПО РЕПЛАЮ
 @bot.message_handler(func=lambda msg: True)
 def answer_text(message):
     if not message.text:
@@ -294,7 +301,48 @@ def answer_text(message):
         "/ai"
     )
 
-    # 🛑 В ГРУППЕ отвечаем, если это реплай, тег @бота, команда ИЛИ слово "gemini"
+    # 🎙️ ФИШКА: РАСШИФРОВКА ГОЛОСОВОГО СООБЩЕНИЯ ДРУГА ПО РЕПЛАЮ
+    if message.reply_to_message and (
+        message.reply_to_message.voice or message.reply_to_message.audio
+    ):
+        triggers = [
+            "расшифруй",
+            "текст",
+            "в текст",
+            "что сказал",
+            "переведи",
+            "gemini",
+            "гемини",
+        ]
+        if any(tr in message.text.lower() for tr in triggers):
+            bot.send_chat_action(message.chat.id, "typing")
+            target_voice = (
+                message.reply_to_message.voice or message.reply_to_message.audio
+            )
+            friend = message.reply_to_message.from_user
+            friend_tag = (
+                f"@{friend.username}" if friend.username else friend.first_name
+            )
+
+            try:
+                file_info = bot.get_file(target_voice.file_id)
+                file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_info.file_path}"
+                audio_bytes = requests.get(file_url).content
+                b64_audio = base64.b64encode(audio_bytes).decode("utf-8")
+
+                text_result = transcribe_audio_bytes(b64_audio)
+                if text_result:
+                    wait_slow_mode(message.chat.id)
+                    reply_text = f"🎤 **Расшифровка для {friend_tag}:**\n\n«{text_result.strip()}»"
+                    bot.reply_to(message.reply_to_message, reply_text)
+                    return
+            except Exception:
+                bot.reply_to(
+                    message, "Не удалось прослушать голосовое друга 😢"
+                )
+                return
+
+    # В группе отвечаем, если это обращение к боту
     if not is_private and not (
         is_reply_to_bot or is_mentioned or is_command or is_gemini_word
     ):
@@ -355,8 +403,6 @@ def answer_text(message):
             if "candidates" in res:
                 answer = res["candidates"][0]["content"]["parts"][0]["text"]
                 wait_slow_mode(message.chat.id)
-
-                # 🔥 ЧИСТЫЙ ОТВЕТ: только @username и сам ответ без скобок!
                 clean_reply = f"{username_tag} {answer}"
                 bot.reply_to(message, clean_reply)
 
