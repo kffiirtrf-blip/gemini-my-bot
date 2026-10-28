@@ -1,6 +1,7 @@
 import base64
 import os
 import random
+import re
 import threading
 import time
 import urllib.parse
@@ -71,14 +72,13 @@ def generate_free_art(chat_id, prompt, reply_to_id=None):
         bot.send_message(chat_id, f"Ошибка создания картинки: {err}")
 
 
-# Вспомогательная функция расшифровки аудио
 def transcribe_audio_bytes(b64_audio):
     parts_data = [
         {
             "text": (
                 "Дословно переведи это голосовое сообщение в текст на русском"
                 " языке. Напиши ТОЛЬКО текст того, что сказал человек, без"
-                " лишних комментариев, приветствий и пояснений."
+                " лишних комментариев и пояснений."
             )
         },
         {"inlineData": {"mimeType": "audio/ogg", "data": b64_audio}},
@@ -134,7 +134,7 @@ def clear_memory(message):
     bot.reply_to(message, "🧹 Память диалога очищена!")
 
 
-# 2. Обработка входящих ГОЛОСОВЫХ (напрямую боту)
+# 2. Голосовые сообщения
 @bot.message_handler(content_types=["voice", "audio"])
 def handle_voice(message):
     is_private = message.chat.type == "private"
@@ -168,7 +168,7 @@ def handle_voice(message):
         bot.reply_to(message, "Не удалось распознать голосовое сообщение.")
 
 
-# 3. Обработка ФАЙЛОВ и ДОКУМЕНТОВ
+# 3. Документы и файлы
 @bot.message_handler(content_types=["document"])
 def handle_document(message):
     is_private = message.chat.type == "private"
@@ -176,11 +176,11 @@ def handle_document(message):
         message.reply_to_message is not None
         and message.reply_to_message.from_user.id == bot_info.id
     )
-    caption = message.caption or ""
-    is_gemini = "gemini" in caption.lower() or "гемини" in caption.lower()
-    is_mentioned = f"@{BOT_NAME}" in caption.lower()
+    caption = (message.caption or "").lower()
+    is_name = any(n in caption for n in ["gemini", "гемини", "геминай"])
+    is_mentioned = f"@{BOT_NAME}" in caption
 
-    if not is_private and not (is_reply_to_bot or is_mentioned or is_gemini):
+    if not is_private and not (is_reply_to_bot or is_mentioned or is_name):
         return
 
     bot.send_chat_action(message.chat.id, "typing")
@@ -197,13 +197,9 @@ def handle_document(message):
         bot.reply_to(message, "Не удалось прочитать файл.")
         return
 
-    clean_caption = (
-        caption.replace(f"@{bot_info.username}", "")
-        .replace(f"@{BOT_NAME}", "")
-        .strip()
+    prompt = (
+        message.caption or "Изучи этот документ и подробно ответь, о чем он."
     )
-    prompt = clean_caption or "Изучи этот документ и подробно ответь, о чем он."
-
     parts_data = [
         {"text": f"Пользователь {username_tag} отправил файл. Вопрос: {prompt}"},
         {"inlineData": {"mimeType": mime, "data": b64_doc}},
@@ -224,7 +220,7 @@ def handle_document(message):
     bot.reply_to(message, "Не удалось обработать документ.")
 
 
-# 4. Распознавание ФОТО
+# 4. Фотографии
 @bot.message_handler(content_types=["photo"])
 def handle_photo(message):
     is_private = message.chat.type == "private"
@@ -232,23 +228,17 @@ def handle_photo(message):
         message.reply_to_message is not None
         and message.reply_to_message.from_user.id == bot_info.id
     )
-    caption = message.caption or ""
-    is_gemini = "gemini" in caption.lower() or "гемини" in caption.lower()
-    is_mentioned = f"@{BOT_NAME}" in caption.lower()
+    caption = (message.caption or "").lower()
+    is_name = any(n in caption for n in ["gemini", "гемини", "геминай"])
+    is_mentioned = f"@{BOT_NAME}" in caption
 
-    if not is_private and not (is_reply_to_bot or is_mentioned or is_gemini):
+    if not is_private and not (is_reply_to_bot or is_mentioned or is_name):
         return
 
     bot.send_chat_action(message.chat.id, "typing")
     user = message.from_user
     username_tag = f"@{user.username}" if user.username else user.first_name
-
-    clean_caption = (
-        caption.replace(f"@{bot_info.username}", "")
-        .replace(f"@{BOT_NAME}", "")
-        .strip()
-    )
-    clean_caption = clean_caption or "Опиши подробно, что на фото."
+    clean_caption = message.caption or "Опиши подробно, что на фото."
 
     try:
         file_info = bot.get_file(message.photo[-1].file_id)
@@ -279,7 +269,7 @@ def handle_photo(message):
     bot.reply_to(message, "Ошибка распознавания фото.")
 
 
-# 5. ТЕКСТОВЫЕ ОТВЕТЫ + РАСШИФРОВКА ГС ДРУГА ПО РЕПЛАЮ
+# 5. ТЕКСТОВЫЕ ОТВЕТЫ
 @bot.message_handler(func=lambda msg: True)
 def answer_text(message):
     if not message.text:
@@ -287,21 +277,9 @@ def answer_text(message):
 
     user = message.from_user
     username_tag = f"@{user.username}" if user.username else user.first_name
+    text_lower = message.text.lower()
 
-    is_private = message.chat.type == "private"
-    is_reply_to_bot = (
-        message.reply_to_message is not None
-        and message.reply_to_message.from_user.id == bot_info.id
-    )
-    is_mentioned = f"@{BOT_NAME}" in message.text.lower()
-    is_gemini_word = (
-        "gemini" in message.text.lower() or "гемини" in message.text.lower()
-    )
-    is_command = message.text.startswith("/ask") or message.text.startswith(
-        "/ai"
-    )
-
-    # 🎙️ ФИШКА: РАСШИФРОВКА ГОЛОСОВОГО СООБЩЕНИЯ ДРУГА ПО РЕПЛАЮ
+    # 🎙️ Расшифровка ГС друга по реплаю
     if message.reply_to_message and (
         message.reply_to_message.voice or message.reply_to_message.audio
     ):
@@ -314,7 +292,7 @@ def answer_text(message):
             "gemini",
             "гемини",
         ]
-        if any(tr in message.text.lower() for tr in triggers):
+        if any(tr in text_lower for tr in triggers):
             bot.send_chat_action(message.chat.id, "typing")
             target_voice = (
                 message.reply_to_message.voice or message.reply_to_message.audio
@@ -342,25 +320,50 @@ def answer_text(message):
                 )
                 return
 
-    # В группе отвечаем, если это обращение к боту
+    # Проверка условий ответа
+    is_private = message.chat.type == "private"
+    is_reply_to_bot = (
+        message.reply_to_message is not None
+        and message.reply_to_message.from_user.id == bot_info.id
+    )
+    is_mentioned = f"@{BOT_NAME}" in text_lower
+    is_name_called = any(
+        n in text_lower for n in ["gemini", "гемини", "геминай"]
+    )
+    is_command = message.text.startswith("/ask") or message.text.startswith(
+        "/ai"
+    )
+
+    # Отвечаем, если обратились по имени, реплаем или тегом
     if not is_private and not (
-        is_reply_to_bot or is_mentioned or is_command or is_gemini_word
+        is_reply_to_bot or is_mentioned or is_command or is_name_called
     ):
         return
 
-    clean_text = (
-        message.text.replace(f"@{bot_info.username}", "")
-        .replace(f"@{BOT_NAME}", "")
-        .strip()
-    )
-    if clean_text.startswith("/ask") or clean_text.startswith("/ai"):
-        clean_text = clean_text.split(maxsplit=1)[-1].strip()
+    # Очищаем текст от имени и команд
+    clean_text = message.text
+    for prefix in [
+        f"@{bot_info.username}",
+        f"@{BOT_NAME}",
+        "/ask",
+        "/ai",
+        "gemini",
+        "гемини",
+        "геминай",
+        "Gemini",
+        "Гемини",
+    ]:
+        clean_text = re.sub(
+            re.escape(prefix), "", clean_text, flags=re.IGNORECASE
+        )
+
+    clean_text = clean_text.strip(" ,:.-?!")
 
     if not clean_text:
         bot.reply_to(message, f"{username_tag} Я тут! Чем помочь?")
         return
 
-    # Генерация картинки текстом
+    # Генерация картинок по тексту
     lower = clean_text.lower()
     draw_triggers = [
         "нарисуй мне",
