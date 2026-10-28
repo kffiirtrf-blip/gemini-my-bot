@@ -7,20 +7,17 @@ from flask import Flask
 import requests
 import telebot
 
+# Бот берет секретный ключ безопасно из настроек сервера
 TELEGRAM_TOKEN = "9129090353:AAFOZU4NEVz1SzXow8JQe5CIx1a0sSam19I"
-GEMINI_KEY = "AIzaSyAS-RJstICvgB6z7cEYmwys1C0ni47qdvQ"
+GEMINI_KEY = os.environ.get("GEMINI_KEY", "")
 
-# Актуальные стабильные модели Google
 MODELS = ["gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-3.5-flash"]
 TIMEOUT_SECONDS = 600  # 10 минут памяти
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 bot_info = bot.get_me()
-BOT_NAME = bot_info.username.lower()
 
-# Память: {chat_id: {"last_time": timestamp, "messages": []}}
 chat_memory = {}
-
 app = Flask(__name__)
 
 
@@ -40,7 +37,7 @@ def get_or_reset_memory(chat_id):
     return chat_memory[chat_id]["messages"]
 
 
-# 1. История диалога
+# 1. История /history
 @bot.message_handler(commands=["history"])
 def show_history(message):
     messages = get_or_reset_memory(message.chat.id)
@@ -58,14 +55,14 @@ def show_history(message):
     bot.reply_to(message, text_history)
 
 
-# 2. Очистить память
+# 2. Сброс /clear
 @bot.message_handler(commands=["clear", "reset"])
 def clear_memory(message):
     chat_memory[message.chat.id] = {"last_time": time.time(), "messages": []}
     bot.reply_to(message, "🧹 Память очищена! Начинаем заново.")
 
 
-# 3. Картинки (/img)
+# 3. Картинки /img
 @bot.message_handler(commands=["img", "pic", "image"])
 def generate_image(message):
     parts = message.text.split(maxsplit=1)
