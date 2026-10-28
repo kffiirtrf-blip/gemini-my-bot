@@ -13,17 +13,15 @@ TELEGRAM_TOKEN = "9129090353:AAFOZU4NEVz1SzXow8JQe5CIx1a0sSam19I"
 GEMINI_KEY = os.environ.get("GEMINI_KEY", "")
 
 TEXT_MODELS = ["gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-3.5-flash"]
-TIMEOUT_SECONDS = 600
+TIMEOUT_SECONDS = 600  # Память контекста 10 минут
+ACTIVE_SESSION_SECONDS = 90  # Окно живого диалога без слова "гемини" (90 сек)
 SLOW_MODE_SECONDS = 6
 
-# Системная инструкция: запрещаем LaTeX, требуем читаемую математику
 MATH_INSTRUCTION = (
     "Ты умный помощник в Телеграме. Важнейшее правило оформления: НИКОГДА не используй "
     "LaTeX-разметку (никаких $, $$, \\frac, \\sqrt, \\cdot, \\text и подобных тегов)! "
-    "Телеграм не поддерживает LaTeX. Записывай любые математические и физические формулы "
-    "понятным текстом, используя стандартные юникод-символы: ², ³, √, ±, ÷, ×, ≠, ≤, ≥, π, "
-    "а дроби пиши через наклонную черту / со скобками, например: (a + b) / (c - d). "
-    "Делай шаги решений наглядными и легкими для чтения с телефона."
+    "Телеграм не поддерживает LaTeX. Записывай любые математические формулы понятным текстом "
+    "с юникод-символами: ², ³, √, ±, ÷, ×, ≠, ≤, ≥, π, а дроби пиши через наклонную черту / со скобками."
 )
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
@@ -32,6 +30,8 @@ BOT_NAME = bot_info.username.lower()
 
 chat_memory = {}
 last_send_time = {}
+# Активные сессии живого разговора: {chat_id: {"user_id": int, "expires_at": float}}
+active_sessions = {}
 
 app = Flask(__name__)
 
@@ -41,19 +41,14 @@ def home():
     return "Bot is alive 24/7!"
 
 
-# 🧹 Фильтр-чистильщик: на случай если модель все-таки пропустит LaTeX-теги
 def clean_latex(text):
     if not text:
         return ""
-    # Заменяем \frac{a}{b} на (a)/(b)
     text = re.sub(r"\\frac\{([^}]+)\}\{([^}]+)\}", r"(\1)/(\2)", text)
-    # Заменяем корни
     text = re.sub(r"\\sqrt\{([^}]+)\}", r"√(\1)", text)
     text = re.sub(r"\\sqrt\[(\d+)\]\{([^}]+)\}", r"\1√(\2)", text)
-    # Заменяем служебные теги
     text = re.sub(r"\\text\{([^}]+)\}", r"\1", text)
     text = re.sub(r"\\mathbf\{([^}]+)\}", r"\1", text)
-    # Символы операций
     text = re.sub(r"\\cdot", "·", text)
     text = re.sub(r"\\times", "×", text)
     text = re.sub(r"\\pm", "±", text)
@@ -64,15 +59,13 @@ def clean_latex(text):
     text = re.sub(r"\\pi", "π", text)
     text = re.sub(r"\\infty", "∞", text)
     text = re.sub(r"\\degree", "°", text)
-    # Убираем знаки долларов и латексных скобок
     text = text.replace("$$", "").replace("$", "")
-    text = (
+    return (
         text.replace(r"\[", "")
         .replace(r"\]", "")
         .replace(r"\(", "")
         .replace(r"\)", "")
     )
-    return text
 
 
 def wait_slow_mode(chat_id):
@@ -175,6 +168,7 @@ def show_history(message):
 def clear_memory(message):
     wait_slow_mode(message.chat.id)
     chat_memory[message.chat.id] = {"last_time": time.time(), "messages": []}
+    active_sessions.pop(message.chat.id, None)
     bot.reply_to(message, "🧹 Память диалога очищена!")
 
 
@@ -209,11 +203,16 @@ def handle_voice(message):
         wait_slow_mode(message.chat.id)
         clean_ans = clean_latex(answer)
         bot.reply_to(message, f"{username_tag} {clean_ans}")
+        # Открываем сессию диалога
+        active_sessions[message.chat.id] = {
+            "user_id": user.id,
+            "expires_at": time.time() + ACTIVE_SESSION_SECONDS,
+        }
     else:
         bot.reply_to(message, "Не удалось распознать голосовое сообщение.")
 
 
-# 3. Документы и файлы
+# 3. Документы
 @bot.message_handler(content_types=["document"])
 def handle_document(message):
     is_private = message.chat.type == "private"
@@ -263,13 +262,17 @@ def handle_document(message):
                 wait_slow_mode(message.chat.id)
                 clean_ans = clean_latex(answer)
                 bot.reply_to(message, f"{username_tag} {clean_ans}")
+                active_sessions[message.chat.id] = {
+                    "user_id": user.id,
+                    "expires_at": time.time() + ACTIVE_SESSION_SECONDS,
+                }
                 return
         except Exception:
             continue
     bot.reply_to(message, "Не удалось обработать документ.")
 
 
-# 4. Фотографии (включая фото задач и уравнений)
+# 4. Фотографии
 @bot.message_handler(content_types=["photo"])
 def handle_photo(message):
     is_private = message.chat.type == "private"
@@ -318,13 +321,17 @@ def handle_photo(message):
                 wait_slow_mode(message.chat.id)
                 clean_ans = clean_latex(answer)
                 bot.reply_to(message, f"{username_tag} {clean_ans}")
+                active_sessions[message.chat.id] = {
+                    "user_id": user.id,
+                    "expires_at": time.time() + ACTIVE_SESSION_SECONDS,
+                }
                 return
         except Exception:
             continue
     bot.reply_to(message, "Ошибка распознавания фото.")
 
 
-# 5. ТЕКСТОВЫЕ ОТВЕТЫ (МАТЕМАТИКА БЕЗ LATEX)
+# 5. ТЕКСТОВЫЕ ОТВЕТЫ (УМНЫЙ РЕЖИМ ЖИВОГО ДИАЛОГА)
 @bot.message_handler(func=lambda msg: True)
 def answer_text(message):
     if not message.text:
@@ -333,8 +340,11 @@ def answer_text(message):
     user = message.from_user
     username_tag = f"@{user.username}" if user.username else user.first_name
     text_lower = message.text.lower()
+    now = time.time()
+    chat_id = message.chat.id
+    is_private = message.chat.type == "private"
 
-    # Расшифровка ГС друга
+    # 🎙️ Расшифровка ГС друга
     if message.reply_to_message and (
         message.reply_to_message.voice or message.reply_to_message.audio
     ):
@@ -348,7 +358,7 @@ def answer_text(message):
             "гемини",
         ]
         if any(tr in text_lower for tr in triggers):
-            bot.send_chat_action(message.chat.id, "typing")
+            bot.send_chat_action(chat_id, "typing")
             target_voice = (
                 message.reply_to_message.voice or message.reply_to_message.audio
             )
@@ -365,7 +375,7 @@ def answer_text(message):
 
                 text_result = transcribe_audio_bytes(b64_audio)
                 if text_result:
-                    wait_slow_mode(message.chat.id)
+                    wait_slow_mode(chat_id)
                     reply_text = f"🎤 **Расшифровка для {friend_tag}:**\n\n«{text_result.strip()}»"
                     bot.reply_to(message.reply_to_message, reply_text)
                     return
@@ -375,7 +385,48 @@ def answer_text(message):
                 )
                 return
 
-    is_private = message.chat.type == "private"
+    # 🛑 ПРОВЕРКА: Активна ли сессия живого диалога в этом чате?
+    session = active_sessions.get(chat_id)
+    is_in_active_session = False
+
+    if session:
+        if now < session["expires_at"]:
+            # Если человек ответил реплаем на сообщение ДРУГА (не бота) -> выходим из сессии, бот молчит!
+            if (
+                message.reply_to_message
+                and message.reply_to_message.from_user.id != bot_info.id
+            ):
+                active_sessions.pop(chat_id, None)
+                is_in_active_session = False
+            # Если в сообщении явно обращаются к пацанам
+            elif any(
+                w in text_lower
+                for w in [
+                    "пацаны",
+                    "парни",
+                    "го в ",
+                    "гоу в ",
+                    "илья",
+                    "серёга",
+                    "женя",
+                ]
+            ):
+                active_sessions.pop(chat_id, None)
+                is_in_active_session = False
+            else:
+                is_in_active_session = True
+        else:
+            active_sessions.pop(chat_id, None)
+
+    # Слова для быстрого завершения разговора с ботом
+    stop_words = ["отбой", "хватит", "молчи", "стоп", "пока", "все спасибо"]
+    if is_in_active_session and any(w in text_lower for w in stop_words):
+        active_sessions.pop(chat_id, None)
+        wait_slow_mode(chat_id)
+        bot.reply_to(message, f"{username_tag} Понял, не мешаю разговору! 👍")
+        return
+
+    # Базовые триггеры вызова
     is_reply_to_bot = (
         message.reply_to_message is not None
         and message.reply_to_message.from_user.id == bot_info.id
@@ -388,11 +439,19 @@ def answer_text(message):
         "/ai"
     )
 
-    if not is_private and not (
-        is_reply_to_bot or is_mentioned or is_command or is_name_called
-    ):
+    should_respond = (
+        is_private
+        or is_reply_to_bot
+        or is_mentioned
+        or is_command
+        or is_name_called
+        or is_in_active_session
+    )
+
+    if not is_private and not should_respond:
         return
 
+    # Очищаем текст от имени бота
     clean_text = message.text
     for prefix in [
         f"@{bot_info.username}",
@@ -408,7 +467,6 @@ def answer_text(message):
         clean_text = re.sub(
             re.escape(prefix), "", clean_text, flags=re.IGNORECASE
         )
-
     clean_text = clean_text.strip(" ,:.-?!")
 
     if not clean_text:
@@ -435,20 +493,17 @@ def answer_text(message):
         if lower.startswith(trigger):
             art_prompt = clean_text[len(trigger) :].strip(" :,-")
             if art_prompt:
-                generate_free_art(
-                    message.chat.id, art_prompt, message.message_id
-                )
+                generate_free_art(chat_id, art_prompt, message.message_id)
                 return
 
-    bot.send_chat_action(message.chat.id, "typing")
-    history = get_or_reset_memory(message.chat.id)
+    bot.send_chat_action(chat_id, "typing")
+    history = get_or_reset_memory(chat_id)
 
     tagged_message = (
         f"Пользователь {username_tag} ({user.first_name}) пишет: {clean_text}"
     )
     new_user_message = {"role": "user", "parts": [{"text": tagged_message}]}
 
-    # Передаем системную инструкцию прямо в запрос
     data = {
         "systemInstruction": {"parts": [{"text": MATH_INSTRUCTION}]},
         "contents": history + [new_user_message],
@@ -462,12 +517,17 @@ def answer_text(message):
 
             if "candidates" in res:
                 answer = res["candidates"][0]["content"]["parts"][0]["text"]
-                wait_slow_mode(message.chat.id)
+                wait_slow_mode(chat_id)
 
-                # Дополнительно прогоняем через чистильщик на всякий случай
                 clean_ans = clean_latex(answer)
                 clean_reply = f"{username_tag} {clean_ans}"
                 bot.reply_to(message, clean_reply)
+
+                # 🔥 ВКЛЮЧАЕМ/ПРОДЛЕВАЕМ ОКНО ДИАЛОГА НА 90 СЕКУНД:
+                active_sessions[chat_id] = {
+                    "user_id": user.id,
+                    "expires_at": now + ACTIVE_SESSION_SECONDS,
+                }
 
                 history.append(new_user_message)
                 history.append(
@@ -479,7 +539,7 @@ def answer_text(message):
                     }
                 )
                 if len(history) > 20:
-                    chat_memory[message.chat.id]["messages"] = history[-20:]
+                    chat_memory[chat_id]["messages"] = history[-20:]
                 return
         except Exception:
             continue
