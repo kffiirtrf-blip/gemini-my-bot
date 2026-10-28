@@ -12,17 +12,15 @@ TELEGRAM_TOKEN = "9129090353:AAFOZU4NEVz1SzXow8JQe5CIx1a0sSam19I"
 GEMINI_KEY = os.environ.get("GEMINI_KEY", "")
 
 TEXT_MODELS = ["gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-3.5-flash"]
-TIMEOUT_SECONDS = 600  # 10 минут памяти диалога
-SLOW_MODE_SECONDS = 6  # Медленный режим: не чаще 1 раза в 6 секунд
+TIMEOUT_SECONDS = 600  # 10 минут памяти
+SLOW_MODE_SECONDS = 6  # Медленный режим 6 секунд
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 bot_info = bot.get_me()
 BOT_NAME = bot_info.username.lower()
 
-# Память чатов и таймеры
 chat_memory = {}
-last_send_time = {}  # {chat_id: timestamp}
-known_users = {}  # {user_id: {"username": str, "name": str}}
+last_send_time = {}
 
 app = Flask(__name__)
 
@@ -32,7 +30,6 @@ def home():
     return "Bot is alive 24/7!"
 
 
-# ⏱️ Контроль медленного режима (не чаще 1 раза в 6 секунд)
 def wait_slow_mode(chat_id):
     now = time.time()
     last = last_send_time.get(chat_id, 0)
@@ -53,16 +50,13 @@ def get_or_reset_memory(chat_id):
     return chat_memory[chat_id]["messages"]
 
 
-# 🎨 Бесплатная генерация FLUX БЕЗ водяных знаков
+# 🎨 Генерация артов через FLUX (без логотипов)
 def generate_free_art(chat_id, prompt, reply_to_id=None):
     wait_slow_mode(chat_id)
-    bot.send_message(
-        chat_id, "🎨 Рисую через FLUX (без логотипов), подожди секунд 5..."
-    )
+    bot.send_message(chat_id, "🎨 Рисую арт, подожди секунд 5...")
 
     encoded = urllib.parse.quote(prompt)
     seed = random.randint(1000, 999999)
-    # nologo=true убирает водяной знак, model=flux дает максимальный реализм
     image_url = f"https://image.pollinations.ai/prompt/{encoded}?model=flux&nologo=true&seed={seed}&width=1024&height=1024"
 
     try:
@@ -74,10 +68,10 @@ def generate_free_art(chat_id, prompt, reply_to_id=None):
             reply_to_message_id=reply_to_id,
         )
     except Exception as err:
-        bot.send_message(chat_id, f"Ошибка создания арта: {err}")
+        bot.send_message(chat_id, f"Ошибка создания картинки: {err}")
 
 
-# 1. Команда /img
+# 1. Команды /img, /history, /clear
 @bot.message_handler(commands=["img", "pic", "image", "art"])
 def cmd_image(message):
     parts = message.text.split(maxsplit=1)
@@ -90,7 +84,6 @@ def cmd_image(message):
     generate_free_art(message.chat.id, parts[1], message.message_id)
 
 
-# 2. История /history
 @bot.message_handler(commands=["history"])
 def show_history(message):
     wait_slow_mode(message.chat.id)
@@ -101,20 +94,127 @@ def show_history(message):
         )
         return
 
-    text_history = "📜 **История диалога с участниками:**\n\n"
+    text_history = "📜 **История диалога:**\n\n"
     for item in messages:
-        role = "👤" if item["role"] == "user" else "🤖 Бот"
-        part_text = item["parts"][0].get("text", "[Вложение]")
+        role = "👤" if item["role"] == "user" else "🤖"
+        part_text = item["parts"][0].get("text", "[Медиа/Файл]")
         text_history += f"{role} {part_text[:120]}\n"
     bot.reply_to(message, text_history)
 
 
-# 3. Сброс /clear
 @bot.message_handler(commands=["clear", "reset"])
 def clear_memory(message):
     wait_slow_mode(message.chat.id)
     chat_memory[message.chat.id] = {"last_time": time.time(), "messages": []}
-    bot.reply_to(message, "🧹 Память чата очищена!")
+    bot.reply_to(message, "🧹 Память диалога очищена!")
+
+
+# 2. Обработка ГОЛОСОВЫХ сообщений
+@bot.message_handler(content_types=["voice", "audio"])
+def handle_voice(message):
+    is_private = message.chat.type == "private"
+    is_reply_to_bot = (
+        message.reply_to_message is not None
+        and message.reply_to_message.from_user.id == bot_info.id
+    )
+
+    # В группе слушаем голосовые, если это ответ боту
+    if not is_private and not is_reply_to_bot:
+        return
+
+    bot.send_chat_action(message.chat.id, "typing")
+    user = message.from_user
+    username_tag = f"@{user.username}" if user.username else user.first_name
+
+    try:
+        voice = message.voice or message.audio
+        file_info = bot.get_file(voice.file_id)
+        file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_info.file_path}"
+        audio_bytes = requests.get(file_url).content
+        b64_audio = base64.b64encode(audio_bytes).decode("utf-8")
+    except Exception:
+        bot.reply_to(message, "Не удалось загрузить голосовое сообщение.")
+        return
+
+    parts_data = [
+        {
+            "text": (
+                f"Пользователь {username_tag} отправил голосовое сообщение."
+                " Расшифруй его и дай полезный ответ на него."
+            )
+        },
+        {"inlineData": {"mimeType": "audio/ogg", "data": b64_audio}},
+    ]
+    data = {"contents": [{"role": "user", "parts": parts_data}]}
+
+    for model in TEXT_MODELS:
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
+            res = requests.post(url, json=data, timeout=25).json()
+            if "candidates" in res:
+                answer = res["candidates"][0]["content"]["parts"][0]["text"]
+                wait_slow_mode(message.chat.id)
+                bot.reply_to(message, f"{username_tag} {answer}")
+                return
+        except Exception:
+            continue
+    bot.reply_to(message, "Не удалось распознать голосовое сообщение.")
+
+
+# 3. Обработка ФАЙЛОВ и ДОКУМЕНТОВ (PDF, TXT и т.д.)
+@bot.message_handler(content_types=["document"])
+def handle_document(message):
+    is_private = message.chat.type == "private"
+    is_reply_to_bot = (
+        message.reply_to_message is not None
+        and message.reply_to_message.from_user.id == bot_info.id
+    )
+    caption = message.caption or ""
+    is_gemini = "gemini" in caption.lower() or "гемини" in caption.lower()
+    is_mentioned = f"@{BOT_NAME}" in caption.lower()
+
+    if not is_private and not (is_reply_to_bot or is_mentioned or is_gemini):
+        return
+
+    bot.send_chat_action(message.chat.id, "typing")
+    user = message.from_user
+    username_tag = f"@{user.username}" if user.username else user.first_name
+
+    try:
+        file_info = bot.get_file(message.document.file_id)
+        file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_info.file_path}"
+        doc_bytes = requests.get(file_url).content
+        b64_doc = base64.b64encode(doc_bytes).decode("utf-8")
+        mime = message.document.mime_type or "application/pdf"
+    except Exception:
+        bot.reply_to(message, "Не удалось прочитать файл.")
+        return
+
+    clean_caption = (
+        caption.replace(f"@{bot_info.username}", "")
+        .replace(f"@{BOT_NAME}", "")
+        .strip()
+    )
+    prompt = clean_caption or "Изучи этот документ и подробно ответь, о чем он."
+
+    parts_data = [
+        {"text": f"Пользователь {username_tag} отправил файл. Вопрос: {prompt}"},
+        {"inlineData": {"mimeType": mime, "data": b64_doc}},
+    ]
+    data = {"contents": [{"role": "user", "parts": parts_data}]}
+
+    for model in TEXT_MODELS:
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
+            res = requests.post(url, json=data, timeout=30).json()
+            if "candidates" in res:
+                answer = res["candidates"][0]["content"]["parts"][0]["text"]
+                wait_slow_mode(message.chat.id)
+                bot.reply_to(message, f"{username_tag} {answer}")
+                return
+        except Exception:
+            continue
+    bot.reply_to(message, "Не удалось обработать документ.")
 
 
 # 4. Распознавание ФОТО
@@ -126,12 +226,16 @@ def handle_photo(message):
         and message.reply_to_message.from_user.id == bot_info.id
     )
     caption = message.caption or ""
+    is_gemini = "gemini" in caption.lower() or "гемини" in caption.lower()
     is_mentioned = f"@{BOT_NAME}" in caption.lower()
 
-    if not is_private and not (is_reply_to_bot or is_mentioned):
+    if not is_private and not (is_reply_to_bot or is_mentioned or is_gemini):
         return
 
     bot.send_chat_action(message.chat.id, "typing")
+    user = message.from_user
+    username_tag = f"@{user.username}" if user.username else user.first_name
+
     clean_caption = (
         caption.replace(f"@{bot_info.username}", "")
         .replace(f"@{BOT_NAME}", "")
@@ -149,7 +253,7 @@ def handle_photo(message):
         return
 
     parts_data = [
-        {"text": clean_caption},
+        {"text": f"Пользователь {username_tag} отправил фото: {clean_caption}"},
         {"inlineData": {"mimeType": "image/jpeg", "data": b64_image}},
     ]
     data = {"contents": [{"role": "user", "parts": parts_data}]}
@@ -161,22 +265,14 @@ def handle_photo(message):
             if "candidates" in res:
                 answer = res["candidates"][0]["content"]["parts"][0]["text"]
                 wait_slow_mode(message.chat.id)
-                bot.reply_to(message, answer)
-                mem = get_or_reset_memory(message.chat.id)
-                mem.append(
-                    {
-                        "role": "user",
-                        "parts": [{"text": f"[Фото]: {clean_caption}"}],
-                    }
-                )
-                mem.append({"role": "model", "parts": [{"text": answer}]})
+                bot.reply_to(message, f"{username_tag} {answer}")
                 return
         except Exception:
             continue
     bot.reply_to(message, "Ошибка распознавания фото.")
 
 
-# 5. Текстовые ответы с точным определением юзеров
+# 5. Текстовые ответы (РЕАКЦИЯ НА РЕПЛАЙ, ТЕГ И СЛОВО GEMINI)
 @bot.message_handler(func=lambda msg: True)
 def answer_text(message):
     if not message.text:
@@ -184,7 +280,6 @@ def answer_text(message):
 
     user = message.from_user
     username_tag = f"@{user.username}" if user.username else user.first_name
-    known_users[user.id] = {"username": username_tag, "name": user.first_name}
 
     is_private = message.chat.type == "private"
     is_reply_to_bot = (
@@ -192,11 +287,17 @@ def answer_text(message):
         and message.reply_to_message.from_user.id == bot_info.id
     )
     is_mentioned = f"@{BOT_NAME}" in message.text.lower()
+    is_gemini_word = (
+        "gemini" in message.text.lower() or "гемини" in message.text.lower()
+    )
     is_command = message.text.startswith("/ask") or message.text.startswith(
         "/ai"
     )
 
-    if not is_private and not (is_reply_to_bot or is_mentioned or is_command):
+    # 🛑 В ГРУППЕ отвечаем, если это реплай, тег @бота, команда ИЛИ слово "gemini"
+    if not is_private and not (
+        is_reply_to_bot or is_mentioned or is_command or is_gemini_word
+    ):
         return
 
     clean_text = (
@@ -208,10 +309,10 @@ def answer_text(message):
         clean_text = clean_text.split(maxsplit=1)[-1].strip()
 
     if not clean_text:
-        bot.reply_to(message, "Я тут! Чем помочь?")
+        bot.reply_to(message, f"{username_tag} Я тут! Чем помочь?")
         return
 
-    # 🎨 Проверка на генерацию картинки обычным текстом
+    # Генерация картинки текстом
     lower = clean_text.lower()
     draw_triggers = [
         "нарисуй мне",
@@ -239,31 +340,31 @@ def answer_text(message):
     bot.send_chat_action(message.chat.id, "typing")
     history = get_or_reset_memory(message.chat.id)
 
-    # Жесткая идентификация автора (чтобы Gemini не путал друзей):
-    sender_tag = f"[{username_tag} ({user.first_name})]"
-    tagged_message = f"{sender_tag}: {clean_text}"
-
-    # Добавляем в историю с указанием конкретного человека
+    tagged_message = (
+        f"Пользователь {username_tag} ({user.first_name}) пишет: {clean_text}"
+    )
     new_user_message = {"role": "user", "parts": [{"text": tagged_message}]}
     data = {"contents": history + [new_user_message]}
 
     for model in TEXT_MODELS:
         try:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
-            response = requests.post(url, json=data, timeout=10)
+            response = requests.post(url, json=data, timeout=12)
             res = response.json()
 
             if "candidates" in res:
                 answer = res["candidates"][0]["content"]["parts"][0]["text"]
-                # Соблюдаем медленный режим:
                 wait_slow_mode(message.chat.id)
-                bot.reply_to(message, answer)
+
+                # 🔥 ЧИСТЫЙ ОТВЕТ: только @username и сам ответ без скобок!
+                clean_reply = f"{username_tag} {answer}"
+                bot.reply_to(message, clean_reply)
 
                 history.append(new_user_message)
                 history.append(
                     {
                         "role": "model",
-                        "parts": [{"text": f"[Ответ для {username_tag}]: {answer}"}],
+                        "parts": [{"text": f"Ответ для {username_tag}: {answer}"}],
                     }
                 )
                 if len(history) > 20:
@@ -272,7 +373,7 @@ def answer_text(message):
         except Exception:
             continue
 
-    bot.reply_to(message, "Сервера Google заняты, попробуй еще раз!")
+    bot.reply_to(message, f"{username_tag} Сервера Google заняты, повтори!")
 
 
 def run_telebot():
