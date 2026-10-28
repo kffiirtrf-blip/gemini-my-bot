@@ -19,7 +19,7 @@ MATH_RULE = (
 
 bot = telebot.TeleBot(TOKEN)
 bot_name = bot.get_me().username.lower()
-memory, last_send, sessions, last_photo = {}, {}, {}, {}
+memory, last_send, sessions, last_photo, last_video = {}, {}, {}, {}, {}
 
 app = Flask(__name__)
 
@@ -61,7 +61,7 @@ def wait_slow(cid):
     last_send[cid] = time.time()
 
 
-def ask_gemini(data, timeout=15):
+def ask_gemini(data, timeout=25):
     for m in MODELS:
         try:
             r = requests.post(
@@ -89,6 +89,47 @@ def send_art(cid, prompt, rid=None):
         )
     except Exception as e:
         bot.send_message(chat_id=cid, text=f"Ошибка: {e}")
+
+
+def process_video_analysis(file_id, prompt, u_tag, cid, msg_id):
+    """Скачивает видео/кружочек и анализирует через Gemini"""
+    bot.send_chat_action(cid, "record_video")
+    try:
+        f_info = bot.get_file(file_id)
+        if f_info.file_size and f_info.file_size > 20 * 1024 * 1024:
+            bot.send_message(
+                cid,
+                f"{u_tag} Видео весит больше 20 МБ! Телеграм не дает боту"
+                " скачивать такие тяжелые файлы.",
+                reply_to_message_id=msg_id,
+            )
+            return
+        f_bytes = requests.get(
+            f"https://api.telegram.org/file/bot{TOKEN}/{f_info.file_path}"
+        ).content
+        b64 = base64.b64encode(f_bytes).decode("utf-8")
+        d = {
+            "systemInstruction": {"parts": [{"text": MATH_RULE}]},
+            "contents": [{
+                "role": "user",
+                "parts": [
+                    {"text": f"{u_tag}: {prompt or 'Опиши подробно, что происходит на этом видео/кружочке.'}"},
+                    {"inlineData": {"mimeType": "video/mp4", "data": b64}},
+                ],
+            }],
+        }
+        ans = ask_gemini(d, 40)
+        wait_slow(cid)
+        bot.send_message(
+            cid, f"{u_tag} {ans}", reply_to_message_id=msg_id
+        )
+        sessions[cid] = {"u": msg_id, "exp": time.time() + 90}
+    except Exception as e:
+        bot.send_message(
+            cid,
+            f"{u_tag} Не удалось обработать видео: {e}",
+            reply_to_message_id=msg_id,
+        )
 
 
 @bot.message_handler(commands=["img", "pic", "image", "art"])
@@ -152,6 +193,30 @@ def on_voice(m):
         bot.reply_to(m, "Не удалось прослушать аудио.")
 
 
+# 📹 Обработка ВИДЕО и КРУЖОЧКОВ
+@bot.message_handler(content_types=["video", "video_note"])
+def on_video(m):
+    cid = m.chat.id
+    vid_id = m.video.file_id if m.video else m.video_note.file_id
+    last_video[cid] = {"id": vid_id, "t": time.time()}
+
+    cap = (m.caption or "").lower()
+    is_call = (
+        any(x in cap for x in ["gemini", "гемини"])
+        or f"@{bot_name}" in cap
+        or (
+            m.reply_to_message
+            and m.reply_to_message.from_user.id == bot.get_me().id
+        )
+    )
+    if m.chat.type != "private" and not is_call:
+        return
+
+    u_tag = f"@{m.from_user.username or m.from_user.first_name}"
+    prompt = m.caption or "Опиши подробно, что происходит на видео."
+    process_video_analysis(vid_id, prompt, u_tag, cid, m.message_id)
+
+
 @bot.message_handler(content_types=["photo", "document"])
 def on_media(m):
     cid = m.chat.id
@@ -206,6 +271,7 @@ def on_text(m):
     u_tag = f"@{m.from_user.username or m.from_user.first_name}"
     low = txt.lower()
 
+    # Расшифровка ГС
     if (
         m.reply_to_message
         and (m.reply_to_message.voice or m.reply_to_message.audio)
@@ -229,164 +295,3 @@ def on_text(m):
                     ],
                 }]
             }
-            ans = ask_gemini(d, 25)
-            wait_slow(cid)
-            fr = m.reply_to_message.from_user
-            bot.reply_to(
-                m.reply_to_message,
-                f"🎤 Расшифровка для @{fr.username or fr.first_name}:\n\n«{ans.strip()}»",
-            )
-            return
-        except:
-            return bot.reply_to(m, "Ошибка при расшифровке.")
-
-    in_sess = False
-    sess = sessions.get(cid)
-    if sess and now < sess["exp"]:
-        if (
-            m.reply_to_message
-            and m.reply_to_message.from_user.id != bot.get_me().id
-        ):
-            sessions.pop(cid, None)
-        elif any(
-            x in low
-            for x in [
-                "пацаны",
-                "парни",
-                "го в ",
-                "гоу в ",
-                "илья",
-                "серёга",
-                "женя",
-            ]
-        ):
-            sessions.pop(cid, None)
-        else:
-            in_sess = True
-    else:
-        sessions.pop(cid, None)
-
-    if in_sess and any(
-        x in low for x in ["отбой", "хватит", "молчи", "стоп", "пока", "спасибо"]
-    ):
-        sessions.pop(cid, None)
-        return bot.reply_to(m, f"{u_tag} Понял, не мешаю!")
-
-    is_call = (
-        m.chat.type == "private"
-        or in_sess
-        or any(x in low for x in ["gemini", "гемини", "геминай"])
-        or f"@{bot_name}" in low
-        or m.text.startswith(("/ask", "/ai"))
-        or (
-            m.reply_to_message
-            and m.reply_to_message.from_user.id == bot.get_me().id
-        )
-        or bool(m.reply_to_message and m.reply_to_message.photo)
-    )
-    if not is_call:
-        return
-
-    for x in ["gemini", "гемини", "геминай", f"@{bot_name}", "/ask", "/ai"]:
-        txt = re.sub(re.escape(x), "", txt, flags=re.IGNORECASE).strip(
-            " ,:.-?!"
-        )
-
-    for trig in [
-        "нарисуй",
-        "сгенерируй",
-        "сделай картинку",
-        "сделай фото",
-        "изобрази",
-        "создай фото",
-        "создай арт",
-        "draw",
-    ]:
-        if low.startswith(trig):
-            prompt = txt[len(trig) :].strip(" :,-")
-            if prompt:
-                return send_art(cid, prompt, m.message_id)
-
-    target_pid = (
-        m.reply_to_message.photo[-1].file_id
-        if (m.reply_to_message and m.reply_to_message.photo)
-        else None
-    )
-    if not target_pid and any(
-        x in low
-        for x in [
-            "фото",
-            "фотк",
-            "картинк",
-            "выше",
-            "пример",
-            "задач",
-            "снимок",
-        ]
-    ):
-        lp = last_photo.get(cid)
-        if lp and (now - lp["t"] < 1200):
-            target_pid = lp["id"]
-
-    if target_pid:
-        bot.send_chat_action(cid, "typing")
-        try:
-            f = requests.get(
-                f"https://api.telegram.org/file/bot{TOKEN}/{bot.get_file(target_pid).file_path}"
-            ).content
-            b64 = base64.b64encode(f).decode("utf-8")
-            d = {
-                "systemInstruction": {"parts": [{"text": MATH_RULE}]},
-                "contents": [{
-                    "role": "user",
-                    "parts": [
-                        {"text": f"{u_tag}: {txt or 'Реши задачу с фото'}"},
-                        {"inlineData": {"mimeType": "image/jpeg", "data": b64}},
-                    ],
-                }],
-            }
-            ans = ask_gemini(d, 25)
-            wait_slow(cid)
-            bot.reply_to(m, f"{u_tag} {ans}")
-            sessions[cid] = {"u": uid, "exp": now + 90}
-            return
-        except:
-            pass
-
-    if not txt:
-        return bot.reply_to(m, f"{u_tag} Я тут! Чем помочь?")
-
-    bot.send_chat_action(cid, "typing")
-    mem = memory.get(cid, {})
-    if now - mem.get("t", 0) > 600:
-        mem = {"t": now, "msgs": []}
-    mem["t"] = now
-    hist = mem.get("msgs", [])
-
-    new_msg = {"role": "user", "parts": [{"text": f"{u_tag}: {txt}"}]}
-    d = {
-        "systemInstruction": {"parts": [{"text": MATH_RULE}]},
-        "contents": hist + [new_msg],
-    }
-    ans = ask_gemini(d, 15)
-
-    wait_slow(cid)
-    bot.reply_to(m, f"{u_tag} {ans}")
-    sessions[cid] = {"u": uid, "exp": now + 90}
-
-    hist.append(new_msg)
-    hist.append(
-        {"role": "model", "parts": [{"text": f"Ответ для {u_tag}: {ans}"}]}
-    )
-    mem["msgs"] = hist[-20:]
-    memory[cid] = mem
-
-
-if __name__ == "__main__":
-    threading.Thread(
-        target=lambda: bot.infinity_polling(
-            timeout=20, long_polling_timeout=10
-        ),
-        daemon=True,
-    ).start()
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
