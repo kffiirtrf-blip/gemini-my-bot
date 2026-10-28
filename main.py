@@ -413,3 +413,177 @@ def answer_text(message):
                     "парни",
                     "го в ",
                     "гоу в ",
+                    "илья",
+                    "серёга",
+                    "женя",
+                ]
+            ):
+                active_sessions.pop(chat_id, None)
+                is_in_active_session = False
+            else:
+                is_in_active_session = True
+        else:
+            active_sessions.pop(chat_id, None)
+
+    stop_words = ["отбой", "хватит", "молчи", "стоп", "пока", "все спасибо"]
+    if is_in_active_session and any(w in text_lower for w in stop_words):
+        active_sessions.pop(chat_id, None)
+        wait_slow_mode(chat_id)
+        bot.reply_to(message, f"{username_tag} Понял, не мешаю разговору! 👍")
+        return
+
+    is_reply_to_bot = (
+        message.reply_to_message is not None
+        and message.reply_to_message.from_user.id == bot_info.id
+    )
+    is_mentioned = f"@{BOT_NAME}" in text_lower
+    is_name_called = any(
+        n in text_lower for n in ["gemini", "гемини", "геминай"]
+    )
+    is_command = message.text.startswith("/ask") or message.text.startswith(
+        "/ai"
+    )
+
+    # Если человек ответил реплаем на ЛЮБОЕ ФОТО в чате со словами "реши" или "гемини"
+    is_reply_to_any_photo = bool(
+        message.reply_to_message and message.reply_to_message.photo
+    )
+
+    should_respond = (
+        is_private
+        or is_reply_to_bot
+        or is_mentioned
+        or is_command
+        or is_name_called
+        or is_in_active_session
+        or is_reply_to_any_photo
+    )
+
+    if not is_private and not should_respond:
+        return
+
+    clean_text = message.text
+    for prefix in [
+        f"@{bot_info.username}",
+        f"@{BOT_NAME}",
+        "/ask",
+        "/ai",
+        "gemini",
+        "гемини",
+        "геминай",
+        "Gemini",
+        "Гемини",
+    ]:
+        clean_text = re.sub(
+            re.escape(prefix), "", clean_text, flags=re.IGNORECASE
+        )
+    clean_text = clean_text.strip(" ,:.-?!")
+
+    if not clean_text:
+        bot.reply_to(message, f"{username_tag} Я тут! Чем помочь?")
+        return
+
+    # 🖼️ ПРОВЕРКА: Нужно ли подтянуть фото к этому текстовому вопросу?
+    target_photo_id = None
+
+    # Вариант 1: Свайпнули на сообщение с фото
+    if message.reply_to_message and message.reply_to_message.photo:
+        target_photo_id = message.reply_to_message.photo[-1].file_id
+
+    # Вариант 2: Пишут «с фотки выше», «на картинке», «задачу на фото»
+    elif any(
+        w in text_lower
+        for w in [
+            "фото",
+            "фотк",
+            "картинк",
+            "выше",
+            "пример",
+            "задач",
+            "снимок",
+            "рисунок",
+            "уравнени",
+        ]
+    ):
+        last_photo_info = last_chat_photo.get(chat_id)
+        if last_photo_info and (now - last_photo_info["time"] < 1200):  # 20 мин
+            target_photo_id = last_photo_info["file_id"]
+
+    # ЕСЛИ НАШЛИ ФОТО — РЕШАЕМ ЕГО ЧЕРЕЗ ЗРЕНИЕ GEMINI:
+    if target_photo_id:
+        bot.send_chat_action(chat_id, "typing")
+        prompt = (
+            clean_text
+            or "Реши и подробно распиши все математические шаги с этого фото."
+        )
+        ans = solve_image_task(target_photo_id, prompt, username_tag)
+        wait_slow_mode(chat_id)
+        bot.reply_to(message, f"{username_tag} {ans}")
+        active_sessions[chat_id] = {
+            "user_id": user.id,
+            "expires_at": now + ACTIVE_SESSION_SECONDS,
+        }
+        return
+
+    # Генерация картинок по тексту
+    lower = clean_text.lower()
+    draw_triggers = [
+        "нарисуй мне",
+        "нарисуй",
+        "сгенерируй картинку",
+        "сгенерируй фото",
+        "сгенерируй арт",
+        "сгенерируй",
+        "сделай картинку",
+        "сделай фото",
+        "изобрази",
+        "создай фото",
+        "создай арт",
+        "draw",
+    ]
+    for trigger in draw_triggers:
+        if lower.startswith(trigger):
+            art_prompt = clean_text[len(trigger) :].strip(" :,-")
+            if art_prompt:
+                generate_free_art(chat_id, art_prompt, message.message_id)
+                return
+
+    # Обычный текстовый диалог
+    bot.send_chat_action(chat_id, "typing")
+    history = get_or_reset_memory(chat_id)
+
+    tagged_message = (
+        f"Пользователь {username_tag} ({user.first_name}) пишет: {clean_text}"
+    )
+    new_user_message = {"role": "user", "parts": [{"text": tagged_message}]}
+
+    data = {
+        "systemInstruction": {"parts": [{"text": MATH_INSTRUCTION}]},
+        "contents": history + [new_user_message],
+    }
+
+    for model in TEXT_MODELS:
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
+            response = requests.post(url, json=data, timeout=12)
+            res = response.json()
+
+            if "candidates" in res:
+                answer = res["candidates"][0]["content"]["parts"][0]["text"]
+                wait_slow_mode(chat_id)
+
+                clean_ans = clean_latex(answer)
+                clean_reply = f"{username_tag} {clean_ans}"
+                bot.reply_to(message, clean_reply)
+
+                active_sessions[chat_id] = {
+                    "user_id": user.id,
+                    "expires_at": now + ACTIVE_SESSION_SECONDS,
+                }
+
+                history.append(new_user_message)
+                history.append(
+                    {
+                        "role": "model",
+                        "parts": [
+                   
