@@ -19,7 +19,7 @@ MATH_RULE = (
 
 bot = telebot.TeleBot(TOKEN)
 bot_name = bot.get_me().username.lower()
-memory, last_send, sessions, last_photo, last_video = {}, {}, {}, {}, {}
+memory, last_send, sessions, last_media = {}, {}, {}, {}
 
 app = Flask(__name__)
 
@@ -61,7 +61,20 @@ def wait_slow(cid):
     last_send[cid] = time.time()
 
 
-def ask_gemini(data, timeout=25):
+def ask_ai(prompt, mime=None, b64=None, timeout=25, custom_contents=None):
+    if custom_contents:
+        data = {
+            "systemInstruction": {"parts": [{"text": MATH_RULE}]},
+            "contents": custom_contents,
+        }
+    else:
+        parts = [{"text": prompt}]
+        if mime and b64:
+            parts.append({"inlineData": {"mimeType": mime, "data": b64}})
+        data = {
+            "systemInstruction": {"parts": [{"text": MATH_RULE}]},
+            "contents": [{"role": "user", "parts": parts}],
+        }
     for m in MODELS:
         try:
             r = requests.post(
@@ -75,7 +88,17 @@ def ask_gemini(data, timeout=25):
                 )
         except:
             pass
-    return "Сервера Google заняты, попробуй еще раз!"
+    return "Сервера Google заняты, попробуй позже!"
+
+
+def download_b64(fid):
+    f = bot.get_file(fid)
+    if f.file_size and f.file_size > 20 * 1024 * 1024:
+        return None
+    b = requests.get(
+        f"https://api.telegram.org/file/bot{TOKEN}/{f.file_path}"
+    ).content
+    return base64.b64encode(b).decode("utf-8")
 
 
 def send_art(cid, prompt, rid=None):
@@ -89,47 +112,6 @@ def send_art(cid, prompt, rid=None):
         )
     except Exception as e:
         bot.send_message(chat_id=cid, text=f"Ошибка: {e}")
-
-
-def process_video_analysis(file_id, prompt, u_tag, cid, msg_id):
-    """Скачивает видео/кружочек и анализирует через Gemini"""
-    bot.send_chat_action(cid, "record_video")
-    try:
-        f_info = bot.get_file(file_id)
-        if f_info.file_size and f_info.file_size > 20 * 1024 * 1024:
-            bot.send_message(
-                cid,
-                f"{u_tag} Видео весит больше 20 МБ! Телеграм не дает боту"
-                " скачивать такие тяжелые файлы.",
-                reply_to_message_id=msg_id,
-            )
-            return
-        f_bytes = requests.get(
-            f"https://api.telegram.org/file/bot{TOKEN}/{f_info.file_path}"
-        ).content
-        b64 = base64.b64encode(f_bytes).decode("utf-8")
-        d = {
-            "systemInstruction": {"parts": [{"text": MATH_RULE}]},
-            "contents": [{
-                "role": "user",
-                "parts": [
-                    {"text": f"{u_tag}: {prompt or 'Опиши подробно, что происходит на этом видео/кружочке.'}"},
-                    {"inlineData": {"mimeType": "video/mp4", "data": b64}},
-                ],
-            }],
-        }
-        ans = ask_gemini(d, 40)
-        wait_slow(cid)
-        bot.send_message(
-            cid, f"{u_tag} {ans}", reply_to_message_id=msg_id
-        )
-        sessions[cid] = {"u": msg_id, "exp": time.time() + 90}
-    except Exception as e:
-        bot.send_message(
-            cid,
-            f"{u_tag} Не удалось обработать видео: {e}",
-            reply_to_message_id=msg_id,
-        )
 
 
 @bot.message_handler(commands=["img", "pic", "image", "art"])
@@ -160,7 +142,7 @@ def cmd_hist(m):
 def cmd_clear(m):
     memory.pop(m.chat.id, None)
     sessions.pop(m.chat.id, None)
-    bot.reply_to(m, "🧹 Память очищена!")
+    bot.reply_to(m, "🧹 Память диалога очищена!")
 
 
 @bot.message_handler(content_types=["voice", "audio"])
@@ -171,20 +153,13 @@ def on_voice(m):
         return
     bot.send_chat_action(m.chat.id, "typing")
     try:
-        f = requests.get(
-            f"https://api.telegram.org/file/bot{TOKEN}/{bot.get_file((m.voice or m.audio).file_id).file_path}"
-        ).content
-        b64 = base64.b64encode(f).decode("utf-8")
-        d = {
-            "contents": [{
-                "role": "user",
-                "parts": [
-                    {"text": "Дословно переведи в текст без комментариев."},
-                    {"inlineData": {"mimeType": "audio/ogg", "data": b64}},
-                ],
-            }]
-        }
-        ans = ask_gemini(d, 25)
+        b64 = download_b64((m.voice or m.audio).file_id)
+        ans = ask_ai(
+            "Дословно переведи голосовое в текст без лишних слов.",
+            "audio/ogg",
+            b64,
+            25,
+        )
         wait_slow(m.chat.id)
         bot.reply_to(
             m, f"@{m.from_user.username or m.from_user.first_name} {ans}"
@@ -193,35 +168,25 @@ def on_voice(m):
         bot.reply_to(m, "Не удалось прослушать аудио.")
 
 
-# 📹 Обработка ВИДЕО и КРУЖОЧКОВ
-@bot.message_handler(content_types=["video", "video_note"])
-def on_video(m):
-    cid = m.chat.id
-    vid_id = m.video.file_id if m.video else m.video_note.file_id
-    last_video[cid] = {"id": vid_id, "t": time.time()}
-
-    cap = (m.caption or "").lower()
-    is_call = (
-        any(x in cap for x in ["gemini", "гемини"])
-        or f"@{bot_name}" in cap
-        or (
-            m.reply_to_message
-            and m.reply_to_message.from_user.id == bot.get_me().id
-        )
-    )
-    if m.chat.type != "private" and not is_call:
-        return
-
-    u_tag = f"@{m.from_user.username or m.from_user.first_name}"
-    prompt = m.caption or "Опиши подробно, что происходит на видео."
-    process_video_analysis(vid_id, prompt, u_tag, cid, m.message_id)
-
-
-@bot.message_handler(content_types=["photo", "document"])
+@bot.message_handler(
+    content_types=["photo", "video", "video_note", "document"]
+)
 def on_media(m):
     cid = m.chat.id
+    fid, mime = None, "image/jpeg"
     if m.photo:
-        last_photo[cid] = {"id": m.photo[-1].file_id, "t": time.time()}
+        fid, mime = m.photo[-1].file_id, "image/jpeg"
+    elif m.video:
+        fid, mime = m.video.file_id, "video/mp4"
+    elif m.video_note:
+        fid, mime = m.video_note.file_id, "video/mp4"
+    elif m.document:
+        fid, mime = m.document.file_id, (
+            m.document.mime_type or "application/pdf"
+        )
+
+    last_media[cid] = {"id": fid, "mime": mime, "t": time.time()}
+
     cap = (m.caption or "").lower()
     is_call = (
         any(x in cap for x in ["gemini", "гемини"])
@@ -233,34 +198,22 @@ def on_media(m):
     )
     if m.chat.type != "private" and not is_call:
         return
+
     bot.send_chat_action(cid, "typing")
     u_tag = f"@{m.from_user.username or m.from_user.first_name}"
-    try:
-        fid = m.photo[-1].file_id if m.photo else m.document.file_id
-        mime = (
-            "image/jpeg" if m.photo else (m.document.mime_type or "application/pdf")
-        )
-        f = requests.get(
-            f"https://api.telegram.org/file/bot{TOKEN}/{bot.get_file(fid).file_path}"
-        ).content
-        b64 = base64.b64encode(f).decode("utf-8")
-        p = m.caption or "Опиши подробно или реши задачу."
-        d = {
-            "systemInstruction": {"parts": [{"text": MATH_RULE}]},
-            "contents": [{
-                "role": "user",
-                "parts": [
-                    {"text": f"{u_tag}: {p}"},
-                    {"inlineData": {"mimeType": mime, "data": b64}},
-                ],
-            }],
-        }
-        ans = ask_gemini(d, 30)
-        wait_slow(cid)
-        bot.reply_to(m, f"{u_tag} {ans}")
-        sessions[cid] = {"u": m.from_user.id, "exp": time.time() + 90}
-    except:
-        bot.reply_to(m, "Не удалось обработать файл/фото.")
+    b64 = download_b64(fid)
+    if not b64:
+        return bot.reply_to(m, "Файл весит больше 20 МБ или не скачался.")
+
+    p = m.caption or (
+        "Опиши что на видео"
+        if "video" in mime
+        else "Опиши подробно или реши задачу."
+    )
+    ans = ask_ai(f"{u_tag}: {p}", mime, b64, 35)
+    wait_slow(cid)
+    bot.reply_to(m, f"{u_tag} {ans}")
+    sessions[cid] = {"u": m.from_user.id, "exp": time.time() + 90}
 
 
 @bot.message_handler(func=lambda m: True)
@@ -271,7 +224,6 @@ def on_text(m):
     u_tag = f"@{m.from_user.username or m.from_user.first_name}"
     low = txt.lower()
 
-    # Расшифровка ГС
     if (
         m.reply_to_message
         and (m.reply_to_message.voice or m.reply_to_message.audio)
@@ -282,16 +234,170 @@ def on_text(m):
     ):
         bot.send_chat_action(cid, "typing")
         try:
-            f = requests.get(
-                f"https://api.telegram.org/file/bot{TOKEN}/{bot.get_file((m.reply_to_message.voice or m.reply_to_message.audio).file_id).file_path}"
-            ).content
-            b64 = base64.b64encode(f).decode("utf-8")
-            d = {
-                "contents": [{
-                    "role": "user",
-                    "parts": [
-                        {"text": "Дословно переведи в текст без комментариев."},
-                        {"inlineData": {"mimeType": "audio/ogg", "data": b64}},
-                    ],
-                }]
-            }
+            b64 = download_b64(
+                (m.reply_to_message.voice or m.reply_to_message.audio).file_id
+            )
+            ans = ask_ai(
+                "Дословно переведи аудио в текст без комментариев.",
+                "audio/ogg",
+                b64,
+                25,
+            )
+            wait_slow(cid)
+            fr = m.reply_to_message.from_user
+            bot.reply_to(
+                m.reply_to_message,
+                f"🎤 Расшифровка для @{fr.username or fr.first_name}:\n\n«{ans.strip()}»",
+            )
+            return
+        except:
+            return bot.reply_to(m, "Ошибка при расшифровке.")
+
+    rep_media = None
+    if m.reply_to_message:
+        rm = m.reply_to_message
+        if rm.photo:
+            rep_media = (rm.photo[-1].file_id, "image/jpeg")
+        elif rm.video:
+            rep_media = (rm.video.file_id, "video/mp4")
+        elif rm.video_note:
+            rep_media = (rm.video_note.file_id, "video/mp4")
+        elif rm.document:
+            rep_media = (
+                rm.document.file_id,
+                rm.document.mime_type or "application/pdf",
+            )
+
+    in_sess = False
+    sess = sessions.get(cid)
+    if sess and now < sess["exp"]:
+        if (
+            m.reply_to_message
+            and m.reply_to_message.from_user.id != bot.get_me().id
+        ):
+            sessions.pop(cid, None)
+        elif any(
+            x in low
+            for x in [
+                "пацаны",
+                "парни",
+                "го в ",
+                "гоу в ",
+                "илья",
+                "серёга",
+                "женя",
+            ]
+        ):
+            sessions.pop(cid, None)
+        else:
+            in_sess = True
+    else:
+        sessions.pop(cid, None)
+
+    if in_sess and any(
+        x in low for x in ["отбой", "хватит", "молчи", "стоп", "пока", "спасибо"]
+    ):
+        sessions.pop(cid, None)
+        return bot.reply_to(m, f"{u_tag} Понял, не мешаю!")
+
+    is_call = (
+        m.chat.type == "private"
+        or in_sess
+        or any(x in low for x in ["gemini", "гемини", "геминай"])
+        or f"@{bot_name}" in low
+        or m.text.startswith(("/ask", "/ai"))
+        or (
+            m.reply_to_message
+            and m.reply_to_message.from_user.id == bot.get_me().id
+        )
+        or bool(rep_media)
+    )
+    if not is_call:
+        return
+
+    for x in ["gemini", "гемини", "геминай", f"@{bot_name}", "/ask", "/ai"]:
+        txt = re.sub(re.escape(x), "", txt, flags=re.IGNORECASE).strip(
+            " ,:.-?!"
+        )
+
+    for trig in [
+        "нарисуй",
+        "сгенерируй",
+        "сделай картинку",
+        "сделай фото",
+        "изобрази",
+        "создай фото",
+        "создай арт",
+        "draw",
+    ]:
+        if low.startswith(trig):
+            prompt = txt[len(trig) :].strip(" :,-")
+            if prompt:
+                return send_art(cid, prompt, m.message_id)
+
+    target_media = rep_media
+    if not target_media and any(
+        x in low
+        for x in [
+            "фото",
+            "фотк",
+            "видео",
+            "кружоч",
+            "картинк",
+            "выше",
+            "пример",
+            "задач",
+        ]
+    ):
+        lm = last_media.get(cid)
+        if lm and (now - lm["t"] < 1200):
+            target_media = (lm["id"], lm["mime"])
+
+    if target_media:
+        bot.send_chat_action(cid, "typing")
+        b64 = download_b64(target_media[0])
+        if b64:
+            ans = ask_ai(
+                f"{u_tag}: {txt or 'Разбери этот файл / фото / видео.'}",
+                target_media[1],
+                b64,
+                35,
+            )
+            wait_slow(cid)
+            bot.reply_to(m, f"{u_tag} {ans}")
+            sessions[cid] = {"u": uid, "exp": now + 90}
+            return
+
+    if not txt:
+        return bot.reply_to(m, f"{u_tag} Я тут! Чем помочь?")
+
+    bot.send_chat_action(cid, "typing")
+    mem = memory.get(cid, {})
+    if now - mem.get("t", 0) > 600:
+        mem = {"t": now, "msgs": []}
+    mem["t"] = now
+    hist = mem.get("msgs", [])
+
+    new_msg = {"role": "user", "parts": [{"text": f"{u_tag}: {txt}"}]}
+    ans = ask_ai(txt, custom_contents=hist + [new_msg])
+
+    wait_slow(cid)
+    bot.reply_to(m, f"{u_tag} {ans}")
+    sessions[cid] = {"u": uid, "exp": now + 90}
+
+    hist.append(new_msg)
+    hist.append(
+        {"role": "model", "parts": [{"text": f"Ответ для {u_tag}: {ans}"}]}
+    )
+    mem["msgs"] = hist[-20:]
+    memory[cid] = mem
+
+
+if __name__ == "__main__":
+    threading.Thread(
+        target=lambda: bot.infinity_polling(
+            timeout=20, long_polling_timeout=10
+        ),
+        daemon=True,
+    ).start()
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
