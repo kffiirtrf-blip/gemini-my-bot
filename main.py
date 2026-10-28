@@ -1,4 +1,5 @@
 import base64
+import io
 import os
 import threading
 import time
@@ -10,14 +11,20 @@ import telebot
 TELEGRAM_TOKEN = "9129090353:AAFOZU4NEVz1SzXow8JQe5CIx1a0sSam19I"
 GEMINI_KEY = os.environ.get("GEMINI_KEY", "")
 
-MODELS = ["gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-3.5-flash"]
-TIMEOUT_SECONDS = 600  # 10 минут памяти
+TEXT_MODELS = ["gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-3.5-flash"]
+IMAGE_MODEL = "gemini-nano-banana-2.1"
+TIMEOUT_SECONDS = 600  # 10 минут памяти диалога
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 bot_info = bot.get_me()
 BOT_NAME = bot_info.username.lower()
 
+# Память текущих диалогов
 chat_memory = {}
+
+# Досье на участников чата: {user_id: {"name": str, "facts": list}}
+user_dossier = {}
+
 app = Flask(__name__)
 
 
@@ -37,7 +44,70 @@ def get_or_reset_memory(chat_id):
     return chat_memory[chat_id]["messages"]
 
 
-# 1. История диалога
+def update_user_dossier(user, text):
+    """Пассивно запоминает сообщения участников чата для досье"""
+    uid = user.id
+    name = user.first_name or "Друг"
+    if uid not in user_dossier:
+        user_dossier[uid] = {"name": name, "recent_lines": []}
+    if text and len(text) > 3:
+        user_dossier[uid]["recent_lines"].append(text[:100])
+        if len(user_dossier[uid]["recent_lines"]) > 5:
+            user_dossier[uid]["recent_lines"].pop(0)
+
+
+# 1. Генерация картинок через Google Nano Banana 2.1
+@bot.message_handler(commands=["img", "pic", "image", "banana"])
+def generate_image(message):
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        bot.reply_to(
+            message,
+            "Напиши, что нарисовать. Пример:\n/img неоновый банан в космосе",
+        )
+        return
+
+    user_prompt = parts[1]
+    bot.reply_to(message, "🍌 Nano Banana 2.1 генерирует шедевр...")
+
+    # Попытка №1: Официальный Google Nano Banana 2.1
+    try:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{IMAGE_MODEL}:generateContent?key={GEMINI_KEY}"
+        payload = {
+            "contents": [{"parts": [{"text": user_prompt}]}],
+            "generationConfig": {"responseModalities": ["IMAGE"]},
+        }
+        res = requests.post(url, json=payload, timeout=30).json()
+
+        for candidate in res.get("candidates", []):
+            for part in candidate.get("content", {}).get("parts", []):
+                if "inlineData" in part:
+                    img_data = base64.b64decode(part["inlineData"]["data"])
+                    bot.send_photo(
+                        message.chat.id,
+                        io.BytesIO(img_data),
+                        caption=f"🍌 Nano Banana 2.1:\n✨ {user_prompt}",
+                        reply_to_message_id=message.message_id,
+                    )
+                    return
+    except Exception:
+        pass
+
+    # Попытка №2 (Запасная): Бесплатный скоростной шлюз
+    try:
+        encoded = urllib.parse.quote(user_prompt)
+        image_url = f"https://image.pollinations.ai/prompt/{encoded}"
+        bot.send_photo(
+            message.chat.id,
+            image_url,
+            caption=f"✨ {user_prompt}",
+            reply_to_message_id=message.message_id,
+        )
+    except Exception as err:
+        bot.reply_to(message, f"Ошибка создания арта: {err}")
+
+
+# 2. История диалога
 @bot.message_handler(commands=["history"])
 def show_history(message):
     messages = get_or_reset_memory(message.chat.id)
@@ -55,40 +125,14 @@ def show_history(message):
     bot.reply_to(message, text_history)
 
 
-# 2. Очистить память
+# 3. Сброс памяти
 @bot.message_handler(commands=["clear", "reset"])
 def clear_memory(message):
     chat_memory[message.chat.id] = {"last_time": time.time(), "messages": []}
-    bot.reply_to(message, "🧹 Память диалога сброшена!")
+    bot.reply_to(message, "🧹 Память диалога очищена!")
 
 
-# 3. Картинки (/img)
-@bot.message_handler(commands=["img", "pic", "image"])
-def generate_image(message):
-    parts = message.text.split(maxsplit=1)
-    if len(parts) < 2:
-        bot.reply_to(
-            message, "Напиши, что нарисовать. Пример:\n/img кот на скейте"
-        )
-        return
-
-    user_prompt = parts[1]
-    bot.reply_to(message, "🎨 Рисую, подожди немного...")
-    encoded = urllib.parse.quote(user_prompt)
-    image_url = f"https://image.pollinations.ai/prompt/{encoded}"
-
-    try:
-        bot.send_photo(
-            message.chat.id,
-            image_url,
-            caption=f"✨ {user_prompt}",
-            reply_to_message_id=message.message_id,
-        )
-    except Exception as err:
-        bot.reply_to(message, f"Ошибка загрузки картинки: {err}")
-
-
-# 4. Распознавание ФОТО (в группе — только если тегнули или ответили боту)
+# 4. Распознавание ФОТО
 @bot.message_handler(content_types=["photo"])
 def handle_photo(message):
     is_private = message.chat.type == "private"
@@ -99,15 +143,16 @@ def handle_photo(message):
     caption = message.caption or ""
     is_mentioned = f"@{BOT_NAME}" in caption.lower()
 
-    # В группе игнорируем чужие фото, если к боту не обратились
     if not is_private and not (is_reply_to_bot or is_mentioned):
         return
 
     bot.send_chat_action(message.chat.id, "typing")
     clean_caption = (
-        caption.replace(f"@{bot_info.username}", "").replace(f"@{BOT_NAME}", "")
-    ).strip()
-    clean_caption = clean_caption or "Опиши подробно, что изображено на фото."
+        caption.replace(f"@{bot_info.username}", "")
+        .replace(f"@{BOT_NAME}", "")
+        .strip()
+    )
+    clean_caption = clean_caption or "Опиши подробно, что на фото."
 
     try:
         file_info = bot.get_file(message.photo[-1].file_id)
@@ -115,7 +160,7 @@ def handle_photo(message):
         img_bytes = requests.get(file_url).content
         b64_image = base64.b64encode(img_bytes).decode("utf-8")
     except Exception:
-        bot.reply_to(message, "Не удалось загрузить фото из Телеграма.")
+        bot.reply_to(message, "Не удалось загрузить фото.")
         return
 
     parts_data = [
@@ -124,11 +169,10 @@ def handle_photo(message):
     ]
     data = {"contents": [{"role": "user", "parts": parts_data}]}
 
-    for model in MODELS:
+    for model in TEXT_MODELS:
         try:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
             res = requests.post(url, json=data, timeout=15).json()
-
             if "candidates" in res:
                 answer = res["candidates"][0]["content"]["parts"][0]["text"]
                 bot.reply_to(message, answer)
@@ -143,15 +187,18 @@ def handle_photo(message):
                 return
         except Exception:
             continue
+    bot.reply_to(message, "Ошибка распознавания фото.")
 
-    bot.reply_to(message, "Не удалось распознать фото через Google.")
 
-
-# 5. Текстовые ответы (ТОЛЬКО НА РЕПЛАИ ИЛИ ТЕГИ В ГРУППЕ)
+# 5. Текстовые ответы с памятью и досье на друзей
 @bot.message_handler(func=lambda msg: True)
 def answer_text(message):
     if not message.text:
         return
+
+    user = message.from_user
+    # Пассивно обновляем досье на каждого участника группы
+    update_user_dossier(user, message.text)
 
     is_private = message.chat.type == "private"
     is_reply_to_bot = (
@@ -163,7 +210,7 @@ def answer_text(message):
         "/ai"
     )
 
-    # 🛑 В ГРУППЕ МОЛЧИМ, если это не ответ на сообщение бота и не тег!
+    # В группе отвечаем ТОЛЬКО на реплай или тег
     if not is_private and not (is_reply_to_bot or is_mentioned or is_command):
         return
 
@@ -182,10 +229,20 @@ def answer_text(message):
     bot.send_chat_action(message.chat.id, "typing")
     history = get_or_reset_memory(message.chat.id)
 
-    new_user_message = {"role": "user", "parts": [{"text": clean_text}]}
+    # Инструкция: кто обращается к боту и что бот о нем знает
+    dossier = user_dossier.get(user.id, {})
+    notes = ", ".join(dossier.get("recent_lines", []))
+    system_hint = (
+        f"Ты общаешься с участником чата по имени {user.first_name}. "
+    )
+    if notes:
+        system_hint += f"Ранее в чате он говорил: {notes}. "
+
+    user_query = f"[Справка: {system_hint}]\nВопрос от {user.first_name}: {clean_text}"
+    new_user_message = {"role": "user", "parts": [{"text": user_query}]}
     data = {"contents": history + [new_user_message]}
 
-    for model in MODELS:
+    for model in TEXT_MODELS:
         try:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
             response = requests.post(url, json=data, timeout=10)
@@ -195,7 +252,9 @@ def answer_text(message):
                 answer = res["candidates"][0]["content"]["parts"][0]["text"]
                 bot.reply_to(message, answer)
 
-                history.append(new_user_message)
+                history.append(
+                    {"role": "user", "parts": [{"text": clean_text}]}
+                )
                 history.append(
                     {"role": "model", "parts": [{"text": answer}]}
                 )
@@ -205,7 +264,7 @@ def answer_text(message):
         except Exception:
             continue
 
-    bot.reply_to(message, "Сервера Google заняты, попробуй еще раз!")
+    bot.reply_to(message, "Сервера заняты, повтори через пару секунд!")
 
 
 def run_telebot():
