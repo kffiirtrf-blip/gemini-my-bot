@@ -16,6 +16,16 @@ TEXT_MODELS = ["gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-3.5-flash"]
 TIMEOUT_SECONDS = 600
 SLOW_MODE_SECONDS = 6
 
+# Системная инструкция: запрещаем LaTeX, требуем читаемую математику
+MATH_INSTRUCTION = (
+    "Ты умный помощник в Телеграме. Важнейшее правило оформления: НИКОГДА не используй "
+    "LaTeX-разметку (никаких $, $$, \\frac, \\sqrt, \\cdot, \\text и подобных тегов)! "
+    "Телеграм не поддерживает LaTeX. Записывай любые математические и физические формулы "
+    "понятным текстом, используя стандартные юникод-символы: ², ³, √, ±, ÷, ×, ≠, ≤, ≥, π, "
+    "а дроби пиши через наклонную черту / со скобками, например: (a + b) / (c - d). "
+    "Делай шаги решений наглядными и легкими для чтения с телефона."
+)
+
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 bot_info = bot.get_me()
 BOT_NAME = bot_info.username.lower()
@@ -29,6 +39,40 @@ app = Flask(__name__)
 @app.route("/")
 def home():
     return "Bot is alive 24/7!"
+
+
+# 🧹 Фильтр-чистильщик: на случай если модель все-таки пропустит LaTeX-теги
+def clean_latex(text):
+    if not text:
+        return ""
+    # Заменяем \frac{a}{b} на (a)/(b)
+    text = re.sub(r"\\frac\{([^}]+)\}\{([^}]+)\}", r"(\1)/(\2)", text)
+    # Заменяем корни
+    text = re.sub(r"\\sqrt\{([^}]+)\}", r"√(\1)", text)
+    text = re.sub(r"\\sqrt\[(\d+)\]\{([^}]+)\}", r"\1√(\2)", text)
+    # Заменяем служебные теги
+    text = re.sub(r"\\text\{([^}]+)\}", r"\1", text)
+    text = re.sub(r"\\mathbf\{([^}]+)\}", r"\1", text)
+    # Символы операций
+    text = re.sub(r"\\cdot", "·", text)
+    text = re.sub(r"\\times", "×", text)
+    text = re.sub(r"\\pm", "±", text)
+    text = re.sub(r"\\approx", "≈", text)
+    text = re.sub(r"\\neq", "≠", text)
+    text = re.sub(r"\\le(?:q)?", "≤", text)
+    text = re.sub(r"\\ge(?:q)?", "≥", text)
+    text = re.sub(r"\\pi", "π", text)
+    text = re.sub(r"\\infty", "∞", text)
+    text = re.sub(r"\\degree", "°", text)
+    # Убираем знаки долларов и латексных скобок
+    text = text.replace("$$", "").replace("$", "")
+    text = (
+        text.replace(r"\[", "")
+        .replace(r"\]", "")
+        .replace(r"\(", "")
+        .replace(r"\)", "")
+    )
+    return text
 
 
 def wait_slow_mode(chat_id):
@@ -163,7 +207,8 @@ def handle_voice(message):
     answer = transcribe_audio_bytes(b64_audio)
     if answer:
         wait_slow_mode(message.chat.id)
-        bot.reply_to(message, f"{username_tag} {answer}")
+        clean_ans = clean_latex(answer)
+        bot.reply_to(message, f"{username_tag} {clean_ans}")
     else:
         bot.reply_to(message, "Не удалось распознать голосовое сообщение.")
 
@@ -204,7 +249,10 @@ def handle_document(message):
         {"text": f"Пользователь {username_tag} отправил файл. Вопрос: {prompt}"},
         {"inlineData": {"mimeType": mime, "data": b64_doc}},
     ]
-    data = {"contents": [{"role": "user", "parts": parts_data}]}
+    data = {
+        "systemInstruction": {"parts": [{"text": MATH_INSTRUCTION}]},
+        "contents": [{"role": "user", "parts": parts_data}],
+    }
 
     for model in TEXT_MODELS:
         try:
@@ -213,14 +261,15 @@ def handle_document(message):
             if "candidates" in res:
                 answer = res["candidates"][0]["content"]["parts"][0]["text"]
                 wait_slow_mode(message.chat.id)
-                bot.reply_to(message, f"{username_tag} {answer}")
+                clean_ans = clean_latex(answer)
+                bot.reply_to(message, f"{username_tag} {clean_ans}")
                 return
         except Exception:
             continue
     bot.reply_to(message, "Не удалось обработать документ.")
 
 
-# 4. Фотографии
+# 4. Фотографии (включая фото задач и уравнений)
 @bot.message_handler(content_types=["photo"])
 def handle_photo(message):
     is_private = message.chat.type == "private"
@@ -238,7 +287,9 @@ def handle_photo(message):
     bot.send_chat_action(message.chat.id, "typing")
     user = message.from_user
     username_tag = f"@{user.username}" if user.username else user.first_name
-    clean_caption = message.caption or "Опиши подробно, что на фото."
+    clean_caption = (
+        message.caption or "Опиши подробно, что на фото / реши задачу."
+    )
 
     try:
         file_info = bot.get_file(message.photo[-1].file_id)
@@ -253,7 +304,10 @@ def handle_photo(message):
         {"text": f"Пользователь {username_tag} отправил фото: {clean_caption}"},
         {"inlineData": {"mimeType": "image/jpeg", "data": b64_image}},
     ]
-    data = {"contents": [{"role": "user", "parts": parts_data}]}
+    data = {
+        "systemInstruction": {"parts": [{"text": MATH_INSTRUCTION}]},
+        "contents": [{"role": "user", "parts": parts_data}],
+    }
 
     for model in TEXT_MODELS:
         try:
@@ -262,14 +316,15 @@ def handle_photo(message):
             if "candidates" in res:
                 answer = res["candidates"][0]["content"]["parts"][0]["text"]
                 wait_slow_mode(message.chat.id)
-                bot.reply_to(message, f"{username_tag} {answer}")
+                clean_ans = clean_latex(answer)
+                bot.reply_to(message, f"{username_tag} {clean_ans}")
                 return
         except Exception:
             continue
     bot.reply_to(message, "Ошибка распознавания фото.")
 
 
-# 5. ТЕКСТОВЫЕ ОТВЕТЫ
+# 5. ТЕКСТОВЫЕ ОТВЕТЫ (МАТЕМАТИКА БЕЗ LATEX)
 @bot.message_handler(func=lambda msg: True)
 def answer_text(message):
     if not message.text:
@@ -279,7 +334,7 @@ def answer_text(message):
     username_tag = f"@{user.username}" if user.username else user.first_name
     text_lower = message.text.lower()
 
-    # 🎙️ Расшифровка ГС друга по реплаю
+    # Расшифровка ГС друга
     if message.reply_to_message and (
         message.reply_to_message.voice or message.reply_to_message.audio
     ):
@@ -320,7 +375,6 @@ def answer_text(message):
                 )
                 return
 
-    # Проверка условий ответа
     is_private = message.chat.type == "private"
     is_reply_to_bot = (
         message.reply_to_message is not None
@@ -334,13 +388,11 @@ def answer_text(message):
         "/ai"
     )
 
-    # Отвечаем, если обратились по имени, реплаем или тегом
     if not is_private and not (
         is_reply_to_bot or is_mentioned or is_command or is_name_called
     ):
         return
 
-    # Очищаем текст от имени и команд
     clean_text = message.text
     for prefix in [
         f"@{bot_info.username}",
@@ -395,7 +447,12 @@ def answer_text(message):
         f"Пользователь {username_tag} ({user.first_name}) пишет: {clean_text}"
     )
     new_user_message = {"role": "user", "parts": [{"text": tagged_message}]}
-    data = {"contents": history + [new_user_message]}
+
+    # Передаем системную инструкцию прямо в запрос
+    data = {
+        "systemInstruction": {"parts": [{"text": MATH_INSTRUCTION}]},
+        "contents": history + [new_user_message],
+    }
 
     for model in TEXT_MODELS:
         try:
@@ -406,14 +463,19 @@ def answer_text(message):
             if "candidates" in res:
                 answer = res["candidates"][0]["content"]["parts"][0]["text"]
                 wait_slow_mode(message.chat.id)
-                clean_reply = f"{username_tag} {answer}"
+
+                # Дополнительно прогоняем через чистильщик на всякий случай
+                clean_ans = clean_latex(answer)
+                clean_reply = f"{username_tag} {clean_ans}"
                 bot.reply_to(message, clean_reply)
 
                 history.append(new_user_message)
                 history.append(
                     {
                         "role": "model",
-                        "parts": [{"text": f"Ответ для {username_tag}: {answer}"}],
+                        "parts": [
+                            {"text": f"Ответ для {username_tag}: {clean_ans}"}
+                        ],
                     }
                 )
                 if len(history) > 20:
