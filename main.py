@@ -9,17 +9,18 @@ import telebot
 
 TELEGRAM_TOKEN = "9129090353:AAFOZU4NEVz1SzXow8JQe5CIx1a0sSam19I"
 GEMINI_KEY = "AIzaSyAS-RJstICvgB6z7cEYmwys1C0ni47qdvQ"
-MODELS = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.5-flash"]
+
+# Актуальные стабильные модели Google
+MODELS = ["gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-3.5-flash"]
 TIMEOUT_SECONDS = 600  # 10 минут памяти
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 bot_info = bot.get_me()
 BOT_NAME = bot_info.username.lower()
 
-# Память диалогов: {chat_id: {"last_time": timestamp, "messages": []}}
+# Память: {chat_id: {"last_time": timestamp, "messages": []}}
 chat_memory = {}
 
-# Веб-сервер для поддержания жизни на Render
 app = Flask(__name__)
 
 
@@ -29,20 +30,17 @@ def home():
 
 
 def get_or_reset_memory(chat_id):
-    """Проверяет таймаут 10 минут и возвращает активную память"""
     now = time.time()
     if chat_id in chat_memory:
-        # Если прошло больше 10 минут — сбрасываем память
         if now - chat_memory[chat_id]["last_time"] > TIMEOUT_SECONDS:
             chat_memory[chat_id] = {"last_time": now, "messages": []}
     else:
         chat_memory[chat_id] = {"last_time": now, "messages": []}
-
     chat_memory[chat_id]["last_time"] = now
     return chat_memory[chat_id]["messages"]
 
 
-# 1. Команда просмотра истории /history
+# 1. История диалога
 @bot.message_handler(commands=["history"])
 def show_history(message):
     messages = get_or_reset_memory(message.chat.id)
@@ -57,20 +55,17 @@ def show_history(message):
         role = "👤 Вы" if item["role"] == "user" else "🤖 Бот"
         part_text = item["parts"][0].get("text", "[Вложение]")
         text_history += f"{role}: {part_text[:120]}\n"
-
     bot.reply_to(message, text_history)
 
 
-# 2. Команда ручного сброса памяти /clear
+# 2. Очистить память
 @bot.message_handler(commands=["clear", "reset"])
 def clear_memory(message):
     chat_memory[message.chat.id] = {"last_time": time.time(), "messages": []}
-    bot.reply_to(
-        message, "🧹 Память диалога очищена! Начинаем с чистого листа."
-    )
+    bot.reply_to(message, "🧹 Память очищена! Начинаем заново.")
 
 
-# 3. Генерация картинок по команде /img
+# 3. Картинки (/img)
 @bot.message_handler(commands=["img", "pic", "image"])
 def generate_image(message):
     parts = message.text.split(maxsplit=1)
@@ -81,8 +76,7 @@ def generate_image(message):
         return
 
     user_prompt = parts[1]
-    bot.reply_to(message, "🎨 Рисую для чата, подождите...")
-
+    bot.reply_to(message, "🎨 Рисую, подожди немного...")
     encoded = urllib.parse.quote(user_prompt)
     image_url = f"https://image.pollinations.ai/prompt/{encoded}"
 
@@ -97,15 +91,13 @@ def generate_image(message):
         bot.reply_to(message, f"Ошибка загрузки картинки: {err}")
 
 
-# 4. Распознавание ФОТО через Gemini
+# 4. Распознавание ФОТО
 @bot.message_handler(content_types=["photo"])
 def handle_photo(message):
     bot.send_chat_action(message.chat.id, "typing")
-
     caption = message.caption or "Опиши подробно, что изображено на этом фото."
     caption = caption.replace(f"@{bot_info.username}", "").strip()
 
-    # Скачиваем самое качественное фото
     try:
         file_info = bot.get_file(message.photo[-1].file_id)
         file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_info.file_path}"
@@ -115,14 +107,12 @@ def handle_photo(message):
         bot.reply_to(message, "Не удалось загрузить фото из Телеграма.")
         return
 
-    # Формируем запрос с картинкой
     parts_data = [
         {"text": caption},
         {"inlineData": {"mimeType": "image/jpeg", "data": b64_image}},
     ]
     data = {"contents": [{"role": "user", "parts": parts_data}]}
 
-    # Отправляем в Gemini
     for model in MODELS:
         try:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
@@ -131,8 +121,6 @@ def handle_photo(message):
             if "candidates" in res:
                 answer = res["candidates"][0]["content"]["parts"][0]["text"]
                 bot.reply_to(message, answer)
-
-                # Сохраняем текстовое описание в память диалога
                 mem = get_or_reset_memory(message.chat.id)
                 mem.append(
                     {"role": "user", "parts": [{"text": f"[Фото]: {caption}"}]}
@@ -142,10 +130,10 @@ def handle_photo(message):
         except Exception:
             continue
 
-    bot.reply_to(message, "Не удалось обработать фото через Google.")
+    bot.reply_to(message, "Не удалось распознать фото через Google.")
 
 
-# 5. Текстовые ответы с памятью разговора
+# 5. Текстовые ответы с памятью
 @bot.message_handler(func=lambda msg: True)
 def answer_text(message):
     if not message.text:
@@ -160,42 +148,37 @@ def answer_text(message):
         return
 
     bot.send_chat_action(message.chat.id, "typing")
-
-    # Достаем контекст диалога
     history = get_or_reset_memory(message.chat.id)
 
-    # Добавляем новый вопрос
     new_user_message = {"role": "user", "parts": [{"text": clean_text}]}
-    contents = history + [new_user_message]
+    data = {"contents": history + [new_user_message]}
 
-    data = {"contents": contents}
+    last_error_text = "Сервера Google перегружены"
 
     for model in MODELS:
         try:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_KEY}"
-            response = requests.post(url, json=data, timeout=12)
+            response = requests.post(url, json=data, timeout=10)
             res = response.json()
 
             if "candidates" in res:
                 answer = res["candidates"][0]["content"]["parts"][0]["text"]
                 bot.reply_to(message, answer)
 
-                # Запоминаем вопрос и ответ в истории диалога
                 history.append(new_user_message)
                 history.append(
                     {"role": "model", "parts": [{"text": answer}]}
                 )
-
-                # Храним не больше 20 последних сообщений, чтобы не перегружать запрос
                 if len(history) > 20:
                     chat_memory[message.chat.id]["messages"] = history[-20:]
                 return
-        except Exception:
+            elif "error" in res:
+                last_error_text = f"[{model}]: {res['error']['message']}"
+        except Exception as e:
+            last_error_text = f"Сетевая ошибка: {e}"
             continue
 
-    bot.reply_to(
-        message, "Сервера Google сейчас заняты, повтори через пару секунд!"
-    )
+    bot.reply_to(message, f"⚠️ Ошибка:\n{last_error_text}")
 
 
 def run_telebot():
