@@ -61,7 +61,6 @@ def wait_slow(cid):
     last_send[cid] = time.time()
 
 
-# Запись в память чата (для текста, видео, фото и войсов)
 def add_mem(cid, u_text, bot_text):
     now = time.time()
     mem = memory.get(cid, {})
@@ -167,32 +166,16 @@ def cmd_clear(m):
     bot.reply_to(m, "🧹 Память диалога очищена!")
 
 
-@bot.message_handler(content_types=["voice", "audio"])
-def on_voice(m):
-    if m.chat.type != "private" and not (
-        m.reply_to_message and m.reply_to_message.from_user.id == bot.get_me().id
-    ):
-        return
-    bot.send_chat_action(m.chat.id, "typing")
-    u_tag = f"@{m.from_user.username or m.from_user.first_name}"
-    try:
-        b64 = download_b64((m.voice or m.audio).file_id)
-        ans = ask_ai(
-            "Дословно переведи голосовое в текст без лишних слов.",
-            "audio/ogg",
-            b64,
-            25,
-        )
-        wait_slow(m.chat.id)
-        bot.reply_to(m, f"{u_tag} {ans}")
-        add_mem(m.chat.id, f"🎤 [Голосовое от {u_tag}]", ans)
-        sessions[m.chat.id] = {"u": m.from_user.id, "exp": time.time() + 90}
-    except:
-        bot.reply_to(m, "Не удалось прослушать аудио.")
-
-
+# Обработка входящих медиа (фото, видео, кружочки, документы)
 @bot.message_handler(
-    content_types=["photo", "video", "video_note", "document"]
+    content_types=[
+        "photo",
+        "video",
+        "video_note",
+        "document",
+        "voice",
+        "audio",
+    ]
 )
 def on_media(m):
     cid = m.chat.id
@@ -209,7 +192,10 @@ def on_media(m):
             (m.document.mime_type or "application/pdf"),
             "Документ",
         )
+    elif m.voice or m.audio:
+        fid, mime, mtype = (m.voice or m.audio).file_id, "audio/ogg", "Голосовое"
 
+    # Запоминаем последнее медиа молча
     last_media[cid] = {
         "id": fid,
         "mime": mime,
@@ -219,13 +205,15 @@ def on_media(m):
 
     cap = (m.caption or "").lower()
     is_call = (
-        any(x in cap for x in ["gemini", "гемини"])
+        any(x in cap for x in ["gemini", "гемини", "геминай"])
         or f"@{bot_name}" in cap
         or (
             m.reply_to_message
             and m.reply_to_message.from_user.id == bot.get_me().id
         )
     )
+
+    # В группе реагируем ТОЛЬКО если в подписи есть "гемини" или реплай на бота
     if m.chat.type != "private" and not is_call:
         return
 
@@ -236,34 +224,54 @@ def on_media(m):
         return bot.reply_to(m, "Файл весит больше 20 МБ или не скачался.")
 
     p = m.caption or (
-        "Опиши что на видео"
-        if "video" in mime
-        else "Опиши подробно или реши задачу."
+        "Переведи в текст"
+        if "audio" in mime
+        else (
+            "Опиши подробно, что на видео"
+            if "video" in mime
+            else "Опиши подробно или реши задачу."
+        )
     )
     ans = ask_ai(f"{u_tag}: {p}", mime, b64, 35)
     wait_slow(cid)
     bot.reply_to(m, f"{u_tag} {ans}")
-    # Сохраняем в память!
     add_mem(cid, f"[{mtype} от {u_tag}]: {p}", ans)
     sessions[cid] = {"u": m.from_user.id, "exp": time.time() + 90}
 
 
+# Текстовые сообщения и управление разговором
 @bot.message_handler(func=lambda m: True)
 def on_text(m):
     if not m.text:
         return
     cid, uid, txt, now = m.chat.id, m.from_user.id, m.text, time.time()
     u_tag = f"@{m.from_user.username or m.from_user.first_name}"
-    low = txt.lower()
+    low = txt.lower().strip()
 
-    # Расшифровка голосовых друга
+    # 🛑 1. ПРОВЕРКА КОМАНД СТОП (мгновенно глушит бота)
+    stop_words = [
+        "стоп",
+        "остановись",
+        "хватит",
+        "закончим разговор",
+        "закончим",
+        "отбой",
+        "молчи",
+        "пока",
+        "спасибо хватит",
+    ]
+    if any(w == low or low.startswith(w + " ") for w in stop_words):
+        if cid in sessions:
+            sessions.pop(cid, None)
+            wait_slow(cid)
+            return bot.reply_to(m, f"{u_tag} Понял, умолкаю! Обращайся по имени 👍")
+        return
+
+    # 🛑 2. РАСШИФРОВКА ГОЛОСОВОГО ДРУГА (ТОЛЬКО ПО ИМЕНИ "ГЕМИНИ")
     if (
         m.reply_to_message
         and (m.reply_to_message.voice or m.reply_to_message.audio)
-        and any(
-            x in low
-            for x in ["расшифруй", "текст", "что сказал", "гемини", "gemini"]
-        )
+        and any(x in low for x in ["гемини", "gemini"])
     ):
         bot.send_chat_action(cid, "typing")
         try:
@@ -289,74 +297,44 @@ def on_text(m):
         except:
             return bot.reply_to(m, "Ошибка при расшифровке.")
 
-    rep_media = None
-    if m.reply_to_message:
-        rm = m.reply_to_message
-        if rm.photo:
-            rep_media = (rm.photo[-1].file_id, "image/jpeg", "Фото")
-        elif rm.video:
-            rep_media = (rm.video.file_id, "video/mp4", "Видео")
-        elif rm.video_note:
-            rep_media = (rm.video_note.file_id, "video/mp4", "Кружочек")
-        elif rm.document:
-            rep_media = (
-                rm.document.file_id,
-                rm.document.mime_type or "application/pdf",
-                "Документ",
-            )
-
+    # 🛑 3. ПРОВЕРКА АКТИВНОЙ СЕССИИ ДИАЛОГА
     in_sess = False
     sess = sessions.get(cid)
     if sess and now < sess["exp"]:
+        # Если ты реплаишь ДРУГА (не бота), например Серёгу -> значит ты говоришь с другом, бот молчит!
         if (
             m.reply_to_message
             and m.reply_to_message.from_user.id != bot.get_me().id
         ):
             sessions.pop(cid, None)
-        elif any(
-            x in low
-            for x in [
-                "пацаны",
-                "парни",
-                "го в ",
-                "гоу в ",
-                "илья",
-                "серёга",
-                "женя",
-            ]
-        ):
-            sessions.pop(cid, None)
+            in_sess = False
         else:
             in_sess = True
     else:
         sessions.pop(cid, None)
 
-    if in_sess and any(
-        x in low for x in ["отбой", "хватит", "молчи", "стоп", "пока", "спасибо"]
-    ):
-        sessions.pop(cid, None)
-        return bot.reply_to(m, f"{u_tag} Понял, не мешаю!")
-
-    is_call = (
-        m.chat.type == "private"
-        or in_sess
-        or any(x in low for x in ["gemini", "гемини", "геминай"])
-        or f"@{bot_name}" in low
-        or m.text.startswith(("/ask", "/ai"))
-        or (
-            m.reply_to_message
-            and m.reply_to_message.from_user.id == bot.get_me().id
-        )
-        or bool(rep_media)
+    # 🛑 4. ПРОВЕРКА: ЗОВУТ ЛИ БОТА НАПРЯМУЮ?
+    is_name_called = any(x in low for x in ["gemini", "гемини", "геминай"])
+    is_tag = f"@{bot_name}" in low
+    is_cmd = m.text.startswith(("/ask", "/ai"))
+    is_reply_to_me = bool(
+        m.reply_to_message
+        and m.reply_to_message.from_user.id == bot.get_me().id
     )
-    if not is_call:
-        return
 
+    # В ГРУППЕ: отвечаем ТОЛЬКО если активна сессия ИЛИ позвали по имени / команде / реплаю боту!
+    # Если ты просто ответил на кружок/сообщение друга БЕЗ слова "гемини" — БОТ МОЛЧИТ!
+    if m.chat.type != "private":
+        if not (in_sess or is_name_called or is_tag or is_cmd or is_reply_to_me):
+            return
+
+    # Очищаем текст от имени бота
     for x in ["gemini", "гемини", "геминай", f"@{bot_name}", "/ask", "/ai"]:
         txt = re.sub(re.escape(x), "", txt, flags=re.IGNORECASE).strip(
             " ,:.-?!"
         )
 
+    # Генерация картинок
     for trig in [
         "нарисуй",
         "сгенерируй",
@@ -372,25 +350,39 @@ def on_text(m):
             if prompt:
                 return send_art(cid, prompt, m.message_id)
 
-    target_media = rep_media
-    if not target_media and any(
-        x in low
-        for x in [
-            "фото",
-            "фотк",
-            "видео",
-            "кружоч",
-            "картинк",
-            "выше",
-            "пример",
-            "задач",
-        ]
-    ):
-        lm = last_media.get(cid)
-        if lm and (now - lm["t"] < 1200):
-            target_media = (lm["id"], lm["mime"], lm.get("type", "Медиа"))
+    # Если спросили про медиа и явно позвали гемини (например "гемини посмотри видео выше")
+    target_media = None
+    if is_name_called or is_reply_to_me:
+        if m.reply_to_message:
+            rm = m.reply_to_message
+            if rm.photo:
+                target_media = (rm.photo[-1].file_id, "image/jpeg", "Фото")
+            elif rm.video:
+                target_media = (rm.video.file_id, "video/mp4", "Видео")
+            elif rm.video_note:
+                target_media = (rm.video_note.file_id, "video/mp4", "Кружочек")
+            elif rm.document:
+                target_media = (
+                    rm.document.file_id,
+                    rm.document.mime_type or "application/pdf",
+                    "Документ",
+                )
+        elif any(
+            x in low
+            for x in [
+                "видео",
+                "кружоч",
+                "фото",
+                "фотк",
+                "картинк",
+                "выше",
+                "посмотри",
+            ]
+        ):
+            lm = last_media.get(cid)
+            if lm and (now - lm["t"] < 1200):
+                target_media = (lm["id"], lm["mime"], lm.get("type", "Медиа"))
 
-    # Разбор медиа
     if target_media:
         bot.send_chat_action(cid, "typing")
         b64 = download_b64(target_media[0])
@@ -408,7 +400,7 @@ def on_text(m):
     if not txt:
         return bot.reply_to(m, f"{u_tag} Я тут! Чем помочь?")
 
-    # Обычный диалог с учетом всей истории
+    # Обычный диалог
     bot.send_chat_action(cid, "typing")
     hist = get_hist(cid)
     new_msg = {"role": "user", "parts": [{"text": f"{u_tag}: {txt}"}]}
@@ -417,6 +409,7 @@ def on_text(m):
     wait_slow(cid)
     bot.reply_to(m, f"{u_tag} {ans}")
     add_mem(cid, f"{u_tag}: {txt}", ans)
+    # Продлеваем сессию живого диалога на 90 секунд
     sessions[cid] = {"u": uid, "exp": now + 90}
 
 
