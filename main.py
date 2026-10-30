@@ -9,7 +9,6 @@ from flask import Flask
 import requests
 import telebot
 
-# Ключи надежно защищены в Render Environment:
 TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 KEY = os.environ.get("GEMINI_KEY", "")
 MODELS = ["gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-3.5-flash"]
@@ -19,7 +18,7 @@ MATH_RULE = (
 )
 
 bot = telebot.TeleBot(TOKEN)
-bot_name = bot.get_me().username.lower()
+bot_name = bot.get_me().username.lower() if TOKEN else "bot"
 memory, last_send, sessions, last_media = {}, {}, {}, {}
 
 app = Flask(__name__)
@@ -60,6 +59,28 @@ def wait_slow(cid):
     if d < 6:
         time.sleep(6 - d)
     last_send[cid] = time.time()
+
+
+# Запись в память чата (для текста, видео, фото и войсов)
+def add_mem(cid, u_text, bot_text):
+    now = time.time()
+    mem = memory.get(cid, {})
+    if now - mem.get("t", 0) > 600:
+        mem = {"t": now, "msgs": []}
+    mem["t"] = now
+    hist = mem.get("msgs", [])
+    hist.append({"role": "user", "parts": [{"text": u_text}]})
+    hist.append({"role": "model", "parts": [{"text": bot_text}]})
+    mem["msgs"] = hist[-20:]
+    memory[cid] = mem
+
+
+def get_hist(cid):
+    now = time.time()
+    mem = memory.get(cid, {})
+    if now - mem.get("t", 0) > 600:
+        return []
+    return mem.get("msgs", [])
 
 
 def ask_ai(prompt, mime=None, b64=None, timeout=25, custom_contents=None):
@@ -126,7 +147,7 @@ def cmd_img(m):
 
 @bot.message_handler(commands=["history"])
 def cmd_hist(m):
-    h = memory.get(m.chat.id, {}).get("msgs", [])
+    h = get_hist(m.chat.id)
     if not h:
         return bot.reply_to(m, "Память пуста или прошло 10 минут.")
     txt = "📜 История диалога:\n" + "\n".join([
@@ -153,6 +174,7 @@ def on_voice(m):
     ):
         return
     bot.send_chat_action(m.chat.id, "typing")
+    u_tag = f"@{m.from_user.username or m.from_user.first_name}"
     try:
         b64 = download_b64((m.voice or m.audio).file_id)
         ans = ask_ai(
@@ -162,9 +184,9 @@ def on_voice(m):
             25,
         )
         wait_slow(m.chat.id)
-        bot.reply_to(
-            m, f"@{m.from_user.username or m.from_user.first_name} {ans}"
-        )
+        bot.reply_to(m, f"{u_tag} {ans}")
+        add_mem(m.chat.id, f"🎤 [Голосовое от {u_tag}]", ans)
+        sessions[m.chat.id] = {"u": m.from_user.id, "exp": time.time() + 90}
     except:
         bot.reply_to(m, "Не удалось прослушать аудио.")
 
@@ -174,19 +196,26 @@ def on_voice(m):
 )
 def on_media(m):
     cid = m.chat.id
-    fid, mime = None, "image/jpeg"
+    fid, mime, mtype = None, "image/jpeg", "Медиа"
     if m.photo:
-        fid, mime = m.photo[-1].file_id, "image/jpeg"
+        fid, mime, mtype = m.photo[-1].file_id, "image/jpeg", "Фото"
     elif m.video:
-        fid, mime = m.video.file_id, "video/mp4"
+        fid, mime, mtype = m.video.file_id, "video/mp4", "Видео"
     elif m.video_note:
-        fid, mime = m.video_note.file_id, "video/mp4"
+        fid, mime, mtype = m.video_note.file_id, "video/mp4", "Кружочек"
     elif m.document:
-        fid, mime = m.document.file_id, (
-            m.document.mime_type or "application/pdf"
+        fid, mime, mtype = (
+            m.document.file_id,
+            (m.document.mime_type or "application/pdf"),
+            "Документ",
         )
 
-    last_media[cid] = {"id": fid, "mime": mime, "t": time.time()}
+    last_media[cid] = {
+        "id": fid,
+        "mime": mime,
+        "type": mtype,
+        "t": time.time(),
+    }
 
     cap = (m.caption or "").lower()
     is_call = (
@@ -214,6 +243,8 @@ def on_media(m):
     ans = ask_ai(f"{u_tag}: {p}", mime, b64, 35)
     wait_slow(cid)
     bot.reply_to(m, f"{u_tag} {ans}")
+    # Сохраняем в память!
+    add_mem(cid, f"[{mtype} от {u_tag}]: {p}", ans)
     sessions[cid] = {"u": m.from_user.id, "exp": time.time() + 90}
 
 
@@ -225,6 +256,7 @@ def on_text(m):
     u_tag = f"@{m.from_user.username or m.from_user.first_name}"
     low = txt.lower()
 
+    # Расшифровка голосовых друга
     if (
         m.reply_to_message
         and (m.reply_to_message.voice or m.reply_to_message.audio)
@@ -250,6 +282,9 @@ def on_text(m):
                 m.reply_to_message,
                 f"🎤 Расшифровка для @{fr.username or fr.first_name}:\n\n«{ans.strip()}»",
             )
+            add_mem(
+                cid, f"🎤 [Голосовое от @{fr.username or fr.first_name}]", ans
+            )
             return
         except:
             return bot.reply_to(m, "Ошибка при расшифровке.")
@@ -258,15 +293,16 @@ def on_text(m):
     if m.reply_to_message:
         rm = m.reply_to_message
         if rm.photo:
-            rep_media = (rm.photo[-1].file_id, "image/jpeg")
+            rep_media = (rm.photo[-1].file_id, "image/jpeg", "Фото")
         elif rm.video:
-            rep_media = (rm.video.file_id, "video/mp4")
+            rep_media = (rm.video.file_id, "video/mp4", "Видео")
         elif rm.video_note:
-            rep_media = (rm.video_note.file_id, "video/mp4")
+            rep_media = (rm.video_note.file_id, "video/mp4", "Кружочек")
         elif rm.document:
             rep_media = (
                 rm.document.file_id,
                 rm.document.mime_type or "application/pdf",
+                "Документ",
             )
 
     in_sess = False
@@ -352,46 +388,36 @@ def on_text(m):
     ):
         lm = last_media.get(cid)
         if lm and (now - lm["t"] < 1200):
-            target_media = (lm["id"], lm["mime"])
+            target_media = (lm["id"], lm["mime"], lm.get("type", "Медиа"))
 
+    # Разбор медиа
     if target_media:
         bot.send_chat_action(cid, "typing")
         b64 = download_b64(target_media[0])
         if b64:
-            ans = ask_ai(
-                f"{u_tag}: {txt or 'Разбери этот файл / фото / видео.'}",
-                target_media[1],
-                b64,
-                35,
-            )
+            prompt_text = f"{u_tag}: {txt or 'Разбери это медиа.'}"
+            ans = ask_ai(prompt_text, target_media[1], b64, 35)
             wait_slow(cid)
             bot.reply_to(m, f"{u_tag} {ans}")
+            add_mem(
+                cid, f"[{target_media[2]} от {u_tag}]: {txt or 'Анализ'}", ans
+            )
             sessions[cid] = {"u": uid, "exp": now + 90}
             return
 
     if not txt:
         return bot.reply_to(m, f"{u_tag} Я тут! Чем помочь?")
 
+    # Обычный диалог с учетом всей истории
     bot.send_chat_action(cid, "typing")
-    mem = memory.get(cid, {})
-    if now - mem.get("t", 0) > 600:
-        mem = {"t": now, "msgs": []}
-    mem["t"] = now
-    hist = mem.get("msgs", [])
-
+    hist = get_hist(cid)
     new_msg = {"role": "user", "parts": [{"text": f"{u_tag}: {txt}"}]}
     ans = ask_ai(txt, custom_contents=hist + [new_msg])
 
     wait_slow(cid)
     bot.reply_to(m, f"{u_tag} {ans}")
+    add_mem(cid, f"{u_tag}: {txt}", ans)
     sessions[cid] = {"u": uid, "exp": now + 90}
-
-    hist.append(new_msg)
-    hist.append(
-        {"role": "model", "parts": [{"text": f"Ответ для {u_tag}: {ans}"}]}
-    )
-    mem["msgs"] = hist[-20:]
-    memory[cid] = mem
 
 
 if __name__ == "__main__":
