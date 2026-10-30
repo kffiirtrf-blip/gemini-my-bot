@@ -9,7 +9,8 @@ from flask import Flask
 import requests
 import telebot
 
-TOKEN = "9129090353:AAFOZU4NEVz1SzXow8JQe5CIx1a0sSam19I"
+# Ключи надежно защищены в Render Environment:
+TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 KEY = os.environ.get("GEMINI_KEY", "")
 MODELS = ["gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-3.5-flash"]
 MATH_RULE = (
